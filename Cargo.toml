@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-nalgebra = "0.33"
+nalgebra = "0.34"
 rand = "0.9"
 
 [dev-dependencies]

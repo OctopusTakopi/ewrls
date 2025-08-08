@@ -1,7 +1,7 @@
-use std::hint::black_box;
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use nalgebra::DVector;
 use rand::Rng;
+use std::hint::black_box;
 use wrls::WeightedRLS;
 
 fn bench_wrls_update(c: &mut Criterion) {

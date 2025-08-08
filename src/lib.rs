@@ -156,7 +156,6 @@ impl WeightedRLS {
     }
 }
 
-
 // --- Unit Tests ---
 #[cfg(test)]
 mod tests {
@@ -254,6 +253,9 @@ mod tests {
         println!("Norm of difference: {}", difference);
 
         // We expect the parameters to be very close.
-        assert!(difference < 0.1, "Model did not converge to the true parameters.");
+        assert!(
+            difference < 0.1,
+            "Model did not converge to the true parameters."
+        );
     }
 }

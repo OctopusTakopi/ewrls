@@ -1,4 +1,3 @@
-
 use nalgebra::DVector;
 use rand::Rng;
 use wrls::WeightedRLS;
@@ -41,5 +40,7 @@ fn main() {
     println!("\n--- Final Learned Parameters ---");
     println!("Theta (m, b): {}", model.theta.transpose());
     println!("The model learned a linear approximation of the sine wave.");
-    println!("Since the true model is non-linear, these parameters represent the 'best fit' line at the end of the data stream.");
+    println!(
+        "Since the true model is non-linear, these parameters represent the 'best fit' line at the end of the data stream."
+    );
 }
