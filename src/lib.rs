@@ -105,7 +105,7 @@ impl WeightedRLS {
         let denominator = self.lambda + x.dot(&p_x);
 
         // 3. Calculate the gain vector k = (P * x) / denominator. O(d).
-        let gain = p_x / denominator;
+        let gain = &p_x / denominator;
 
         // 4. Calculate the prediction error: e = y - y_pred = y - x^T * theta. O(d).
         let error = y - x.dot(&self.theta);
@@ -116,10 +116,7 @@ impl WeightedRLS {
 
         // 6. Update the covariance matrix: P_new = (1/lambda) * (P_old - k * (x^T * P_old))
         // This uses the Sherman-Morrison formula for O(d^2) efficiency.
-        //   - Compute x^T * P_old: vector-matrix multiplication, O(d^2).
-        //   - Compute k * (x^T * P_old): outer product, O(d^2).
-        //   - Subtract and divide: O(d^2).
-        let x_t_p = x.transpose() * &self.covariance;
+        let x_t_p = p_x.transpose();
         let outer = &gain * &x_t_p;
         self.covariance -= &outer;
         self.covariance /= self.lambda;
