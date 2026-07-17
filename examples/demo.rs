@@ -1,8 +1,8 @@
 //! Streaming regression demo: track a linear relationship through a regime
 //! switch, using the per-update diagnostics for residual monitoring.
 
-use rand::RngExt;
 use ewrls::EwRls;
+use rand::RngExt;
 
 fn main() {
     // Fit y = m*x + b online, features are [x, 1].

@@ -204,15 +204,16 @@ impl Builder {
             max_trace,
             self.dimensions,
         );
-        // A per-entry scale can be finite while the resulting trace d·p0
-        // overflows, leaving a model whose every update breaks down.
-        if !(p0 * self.dimensions as f64).is_finite() {
+        let p = DMatrix::identity(self.dimensions, self.dimensions) * p0;
+        // A per-entry scale can be finite while summing the stored diagonal
+        // overflows. Check the matrix using the same order as `trace()`.
+        if !p.trace().is_finite() {
             return Err(Error::InvalidInitialCovariance(self.initial_covariance));
         }
 
         Ok(EwRls {
             theta: DVector::zeros(self.dimensions),
-            p: DMatrix::identity(self.dimensions, self.dimensions) * p0,
+            p,
             p_x: DVector::zeros(self.dimensions),
             lambda: self.lambda,
             dimensions: self.dimensions,
@@ -240,6 +241,7 @@ pub struct EwRls {
     /// Inverse information (covariance) matrix `P` (`d × d`).
     p: DMatrix<f64>,
     /// Workspace for `P·x`, kept to make updates allocation-free.
+    #[cfg_attr(feature = "serde", serde(skip))]
     p_x: DVector<f64>,
     lambda: f64,
     dimensions: usize,
@@ -328,7 +330,12 @@ impl EwRls {
     ///
     /// On [`Error::NumericalBreakdown`] the observation is rejected before
     /// any state is modified; recover with [`EwRls::reset_covariance`].
-    pub fn update_weighted(&mut self, x: &[f64], y: f64, weight: f64) -> Result<UpdateReport, Error> {
+    pub fn update_weighted(
+        &mut self,
+        x: &[f64],
+        y: f64,
+        weight: f64,
+    ) -> Result<UpdateReport, Error> {
         self.validate_features(x)?;
         if !y.is_finite() {
             return Err(Error::NonFiniteInput);
@@ -368,8 +375,9 @@ impl EwRls {
         }
 
         // Validate the full candidate state before committing anything: every
-        // new parameter must stay finite, every new covariance diagonal must
-        // stay finite and non-negative, and their trace must not overflow.
+        // new parameter and covariance entry must stay finite, every new
+        // covariance diagonal must be non-negative, and its trace must not
+        // overflow.
         // Otherwise the observation has exhausted f64 precision (or
         // overflowed 1/λ) and is rejected with the state untouched.
         let inv_den = 1.0 / denominator;
@@ -385,6 +393,14 @@ impl EwRls {
         if !new_trace.is_finite() {
             return Err(Error::NumericalBreakdown);
         }
+        for j in 0..self.dimensions {
+            for i in 0..self.dimensions {
+                let pij = (self.p[(i, j)] - self.p_x[i] * self.p_x[j] * inv_den) / self.lambda;
+                if !pij.is_finite() {
+                    return Err(Error::NumericalBreakdown);
+                }
+            }
+        }
 
         // θ ← θ + k·e with gain k = P·x / den, element-wise with exactly the
         // expression validated above so the committed values cannot differ.
@@ -392,15 +408,13 @@ impl EwRls {
             self.theta[j] += gain_scale * self.p_x[j];
         }
 
-        // P ← (P − (Px)(Px)ᵀ / den) / λ — symmetric rank-1 downdate with the
-        // 1/λ forgetting folded into the same pass.
-        self.p
-            .ger(-inv_den / self.lambda, &self.p_x, &self.p_x, 1.0 / self.lambda);
-        // The pre-check and ger may round the last ulp differently; pin any
-        // straggler diagonal at zero so no negative variance is ever stored.
+        // P ← (P − (Px)(Px)ᵀ / den) / λ. Keep exactly the evaluation order
+        // validated above: distributing 1/λ across the subtraction can turn
+        // two overflowing terms that should cancel into NaN.
         for j in 0..self.dimensions {
-            if self.p[(j, j)] < 0.0 {
-                self.p[(j, j)] = 0.0;
+            for i in 0..self.dimensions {
+                self.p[(i, j)] =
+                    (self.p[(i, j)] - self.p_x[i] * self.p_x[j] * inv_den) / self.lambda;
             }
         }
 
@@ -460,7 +474,12 @@ impl EwRls {
     /// deliberate move after a known regime change to let the model re-adapt
     /// quickly without discarding `θ`.
     pub fn reset_covariance(&mut self) {
-        let p0 = initial_scale(self.initial_covariance, self.gamma, self.max_trace, self.dimensions);
+        let p0 = initial_scale(
+            self.initial_covariance,
+            self.gamma,
+            self.max_trace,
+            self.dimensions,
+        );
         self.p = DMatrix::identity(self.dimensions, self.dimensions) * p0;
     }
 
@@ -577,6 +596,24 @@ fn initial_scale(delta: f64, gamma: f64, max_trace: f64, dimensions: usize) -> f
     p0.min(max_trace / dimensions as f64)
 }
 
+/// Sum a uniform diagonal in the same order as `DMatrix::trace` without
+/// allocating the matrix.
+#[cfg(feature = "serde")]
+fn diagonal_trace(value: f64, dimensions: usize) -> f64 {
+    (0..dimensions).fold(0.0, |trace, _| trace + value)
+}
+
+/// Allow only the rounding error accumulated while summing a live matrix's
+/// diagonal. This keeps serialized capped models round-trippable.
+#[cfg(feature = "serde")]
+fn trace_within_cap(trace: f64, max_trace: f64, dimensions: usize) -> bool {
+    if trace <= max_trace {
+        return true;
+    }
+    let tolerance = max_trace * (4.0 * f64::EPSILON * dimensions as f64);
+    trace - max_trace <= tolerance
+}
+
 /// Untrusted mirror of [`EwRls`] used to validate deserialized checkpoints
 /// before they become a live model.
 #[cfg(feature = "serde")]
@@ -584,8 +621,6 @@ fn initial_scale(delta: f64, gamma: f64, max_trace: f64, dimensions: usize) -> f
 struct EwRlsCheckpoint {
     theta: DVector<f64>,
     p: DMatrix<f64>,
-    #[allow(dead_code)]
-    p_x: DVector<f64>,
     lambda: f64,
     dimensions: usize,
     initial_covariance: f64,
@@ -618,13 +653,20 @@ impl TryFrom<EwRlsCheckpoint> for EwRls {
             return Err(format!("lambda {} outside (0, 1]", c.lambda));
         }
         if !(c.initial_covariance > 0.0 && c.initial_covariance.is_finite()) {
-            return Err(format!("invalid initial covariance {}", c.initial_covariance));
+            return Err(format!(
+                "invalid initial covariance {}",
+                c.initial_covariance
+            ));
         }
         if c.max_trace.is_nan() || c.max_trace <= 0.0 {
             return Err(format!("invalid max covariance trace {}", c.max_trace));
         }
         if !(c.gamma >= 0.0 && c.gamma.is_finite()) {
             return Err(format!("invalid regularization {}", c.gamma));
+        }
+        let reset_scale = initial_scale(c.initial_covariance, c.gamma, c.max_trace, d);
+        if !diagonal_trace(reset_scale, d).is_finite() {
+            return Err("initial covariance produces a non-finite reset trace".into());
         }
         if c.theta.iter().any(|v| !v.is_finite()) {
             return Err("theta contains a non-finite value".into());
@@ -653,7 +695,7 @@ impl TryFrom<EwRlsCheckpoint> for EwRls {
         if !trace.is_finite() {
             return Err("covariance trace is not finite".into());
         }
-        if trace > c.max_trace {
+        if !trace_within_cap(trace, c.max_trace, d) {
             return Err(format!(
                 "covariance trace {trace} exceeds the stored max trace {}",
                 c.max_trace
@@ -673,6 +715,13 @@ impl TryFrom<EwRlsCheckpoint> for EwRls {
             updates: c.updates,
         };
         model.symmetrize();
+        let scale = model.p.amax();
+        if scale > 0.0 {
+            let eigenvalues = (&model.p / scale).symmetric_eigenvalues();
+            if eigenvalues.iter().any(|&v| !v.is_finite() || v < -1e-12) {
+                return Err("covariance is not positive semidefinite".into());
+            }
+        }
         Ok(model)
     }
 }
@@ -690,11 +739,17 @@ mod tests {
         assert_eq!(EwRls::new(3, 1.1).unwrap_err(), Error::InvalidLambda(1.1));
         assert_eq!(EwRls::new(3, 0.0).unwrap_err(), Error::InvalidLambda(0.0));
         assert_eq!(
-            EwRls::builder(3).initial_covariance(-1.0).build().unwrap_err(),
+            EwRls::builder(3)
+                .initial_covariance(-1.0)
+                .build()
+                .unwrap_err(),
             Error::InvalidInitialCovariance(-1.0)
         );
         assert_eq!(
-            EwRls::builder(3).max_covariance_trace(0.0).build().unwrap_err(),
+            EwRls::builder(3)
+                .max_covariance_trace(0.0)
+                .build()
+                .unwrap_err(),
             Error::InvalidMaxTrace(0.0)
         );
         assert!(EwRls::new(3, 1.0).is_ok());
@@ -705,7 +760,10 @@ mod tests {
         let mut model = EwRls::new(2, 0.99).unwrap();
         assert_eq!(
             model.predict(&[1.0]).unwrap_err(),
-            Error::DimensionMismatch { expected: 2, got: 1 }
+            Error::DimensionMismatch {
+                expected: 2,
+                got: 1
+            }
         );
         assert_eq!(
             model.update(&[1.0, f64::NAN], 1.0).unwrap_err(),
@@ -894,12 +952,7 @@ mod tests {
             EwRls::builder(2).regularization(-0.1).build().unwrap_err(),
             Error::InvalidRegularization(-0.1)
         );
-        assert!(
-            EwRls::builder(2)
-                .regularization(f64::NAN)
-                .build()
-                .is_err()
-        );
+        assert!(EwRls::builder(2).regularization(f64::NAN).build().is_err());
     }
 
     #[test]
@@ -1022,6 +1075,16 @@ mod tests {
     }
 
     #[test]
+    fn tiny_lambda_covariance_commit_matches_validation_order() {
+        // The textbook expression cancels to zero. Distributing 1/λ across
+        // the subtraction instead produces +Inf - Inf = NaN.
+        let mut model = EwRls::builder(1).lambda(1e-308).build().unwrap();
+        model.update(&[1.0], 1.0).unwrap();
+        assert_eq!(model.covariance()[(0, 0)], 0.0);
+        assert!(model.covariance_trace().is_finite());
+    }
+
+    #[test]
     fn extreme_scale_never_stores_negative_variance() {
         // Catastrophic cancellation: P shrinks by ~17 digits in one step.
         // The observation is either rejected or committed with non-negative
@@ -1105,7 +1168,10 @@ mod tests {
     #[test]
     fn subnormal_initial_covariance_survives() {
         // 1/δ overflows for subnormal δ; P₀ must still be δ, not zero.
-        let model = EwRls::builder(1).initial_covariance(1e-320).build().unwrap();
+        let model = EwRls::builder(1)
+            .initial_covariance(1e-320)
+            .build()
+            .unwrap();
         assert!(model.covariance_trace() > 0.0);
         assert!((model.covariance_trace() - 1e-320).abs() < 1e-321);
     }
@@ -1120,7 +1186,10 @@ mod tests {
         let tampered = json.replace("1000.0,0.0,0.0,1000.0", "1.0,0.5,-0.5,1.0");
         assert_ne!(tampered, json, "covariance data pattern not found");
         let err = serde_json::from_str::<EwRls>(&tampered).unwrap_err();
-        assert!(err.to_string().contains("symmetric"), "unexpected error: {err}");
+        assert!(
+            err.to_string().contains("symmetric"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -1142,7 +1211,10 @@ mod tests {
         // Per-entry δ is finite but d·δ overflows: reject at construction
         // instead of building a model whose every update breaks down.
         assert_eq!(
-            EwRls::builder(2).initial_covariance(1e308).build().unwrap_err(),
+            EwRls::builder(2)
+                .initial_covariance(1e308)
+                .build()
+                .unwrap_err(),
             Error::InvalidInitialCovariance(1e308)
         );
         // A finite cap constrains the trace, so the same δ is acceptable.
@@ -1152,6 +1224,17 @@ mod tests {
                 .max_covariance_trace(1e10)
                 .build()
                 .is_ok()
+        );
+
+        // Multiplication rounds to MAX, but summing the eleven stored
+        // diagonal entries in matrix-trace order overflows.
+        let delta = f64::MAX / 11.0;
+        assert_eq!(
+            EwRls::builder(11)
+                .initial_covariance(delta)
+                .build()
+                .unwrap_err(),
+            Error::InvalidInitialCovariance(delta)
         );
     }
 
@@ -1168,18 +1251,22 @@ mod tests {
 
         // 10% skew at 1e308 scale: the additive tolerance scale used to
         // overflow to infinity and accept this.
-        let err = serde_json::from_str::<EwRls>(&tamper("1000.0,9e307,1e308,1000.0"))
-            .unwrap_err();
-        assert!(err.to_string().contains("symmetric"), "unexpected error: {err}");
+        let err = serde_json::from_str::<EwRls>(&tamper("1000.0,9e307,1e308,1000.0")).unwrap_err();
+        assert!(
+            err.to_string().contains("symmetric"),
+            "unexpected error: {err}"
+        );
 
-        // Same-sign off-diagonals near f64::MAX: averaging must not overflow.
-        let restored: EwRls =
-            serde_json::from_str(&tamper("1000.0,1e308,1e308,1000.0")).unwrap();
-        assert!(restored.covariance().iter().all(|v| v.is_finite()));
+        // Same-sign off-diagonals near f64::MAX must not overflow while
+        // symmetrizing, and the resulting indefinite matrix is rejected.
+        let err = serde_json::from_str::<EwRls>(&tamper("1000.0,1e308,1e308,1000.0")).unwrap_err();
+        assert!(
+            err.to_string().contains("positive semidefinite"),
+            "unexpected error: {err}"
+        );
 
         // Diagonals whose sum overflows: the trace invariant must reject.
-        let err = serde_json::from_str::<EwRls>(&tamper("1e308,0.0,0.0,1e308"))
-            .unwrap_err();
+        let err = serde_json::from_str::<EwRls>(&tamper("1e308,0.0,0.0,1e308")).unwrap_err();
         assert!(err.to_string().contains("trace"), "unexpected error: {err}");
     }
 
@@ -1198,7 +1285,68 @@ mod tests {
         let tampered = json.replace("50.0,0.0,0.0,50.0", "1000.0,0.0,0.0,1000.0");
         assert_ne!(tampered, json, "covariance data pattern not found");
         let err = serde_json::from_str::<EwRls>(&tampered).unwrap_err();
-        assert!(err.to_string().contains("max trace"), "unexpected error: {err}");
+        assert!(
+            err.to_string().contains("max trace"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn serde_capped_model_roundtrips_with_trace_rounding() {
+        let model = EwRls::builder(9).max_covariance_trace(1.0).build().unwrap();
+        assert!(model.covariance_trace() >= 1.0);
+
+        let json = serde_json::to_string(&model).unwrap();
+        let restored: EwRls = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.covariance(), model.covariance());
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn serde_validates_reset_covariance_trace() {
+        let model = EwRls::new(2, 0.99).unwrap();
+        let json = serde_json::to_string(&model).unwrap();
+        let tampered = json.replace(
+            "\"initial_covariance\":1000.0",
+            "\"initial_covariance\":1e308",
+        );
+        assert_ne!(tampered, json, "initial covariance field not found");
+        let err = serde_json::from_str::<EwRls>(&tampered).unwrap_err();
+        assert!(
+            err.to_string().contains("reset trace"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn serde_rejects_indefinite_covariance() {
+        let model = EwRls::new(2, 0.99).unwrap();
+        let json = serde_json::to_string(&model).unwrap();
+        let tampered = json.replace("1000.0,0.0,0.0,1000.0", "1.0,2.0,2.0,1.0");
+        assert_ne!(tampered, json, "covariance data pattern not found");
+        let err = serde_json::from_str::<EwRls>(&tampered).unwrap_err();
+        assert!(
+            err.to_string().contains("positive semidefinite"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn serde_omits_non_finite_scratch_workspace() {
+        let mut model = EwRls::new(1, 1.0).unwrap();
+        assert_eq!(
+            model.update(&[1e308], 1.0).unwrap_err(),
+            Error::NumericalBreakdown
+        );
+
+        let json = serde_json::to_string(&model).unwrap();
+        assert!(!json.contains("p_x"));
+        let restored: EwRls = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.params(), model.params());
+        assert_eq!(restored.covariance(), model.covariance());
     }
 
     #[test]

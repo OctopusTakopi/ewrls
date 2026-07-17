@@ -1,7 +1,7 @@
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use ewrls::EwRls;
 use rand::RngExt;
 use std::hint::black_box;
-use ewrls::EwRls;
 
 /// Pre-generate a pool of random feature vectors so the timed loop measures
 /// the model, not the RNG.
