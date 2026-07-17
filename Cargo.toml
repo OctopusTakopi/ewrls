@@ -2,7 +2,13 @@
 name = "ewrls"
 version = "0.2.0"
 edition = "2024"
+rust-version = "1.97"
 description = "Exponentially-weighted recursive least squares (EW-RLS) online regression"
+license = "MIT"
+repository = "https://github.com/OctopusTakopi/ewrls"
+homepage = "https://github.com/OctopusTakopi/ewrls"
+documentation = "https://docs.rs/ewrls"
+readme = "README.md"
 keywords = ["rls", "online-learning", "regression", "adaptive-filter", "streaming"]
 categories = ["algorithms", "mathematics", "science"]
 
@@ -22,3 +28,6 @@ serde_json = { version = "1.0", features = ["float_roundtrip"] }
 [[bench]]
 name = "ewrls_benchmark"
 harness = false
+
+[package.metadata.docs.rs]
+all-features = true

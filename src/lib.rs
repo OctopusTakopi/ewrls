@@ -1,20 +1,20 @@
 //! Exponentially-weighted recursive least squares (EW-RLS) online regression.
 //!
-//! At every step `t` the model holds the exact minimizer of the exponentially
-//! discounted, per-sample weighted least-squares cost
+//! At every step `t` the model holds the exact minimizer of
 //!
 //! ```text
-//! J_t(θ) = Σ_{i=1..t} λ^{t-i} w_i (y_i - x_iᵀθ)²  +  λ^t δ⁻¹ ‖θ‖²  +  γ ‖θ‖²
+//! J_t(θ) = Σ_{i=1..t} λ^{t-i} w_i (y_i - x_iᵀθ)²
+//!          + λ^t δ⁻¹ ‖θ‖² + θᵀΓ_tθ
 //! ```
 //!
 //! where `λ ∈ (0, 1]` is the forgetting factor, `w_i > 0` is an optional
 //! per-observation weight, `δ` is the initial covariance scale (a ridge
-//! prior: large `δ` means a weak prior on `θ = 0`), and `γ ≥ 0` an optional
-//! *persistent* ridge penalty that, unlike the `δ` prior, does not decay
-//! under forgetting. At `λ = 1` the `γ` term is exact; with `λ < 1` it is
-//! maintained by cycled zero-target pseudo-observations (one coordinate per
-//! update, scaled so the steady-state penalty is `γ` per direction, rippling
-//! down to `γλᵈ` between refreshes).
+//! prior: large `δ` means a weak prior on `θ = 0`), and `Γ_t` is the optional
+//! persistent ridge information. Given configured strength `γ ≥ 0`, it obeys
+//! `Γ_0 = γI` and
+//! `Γ_t = λΓ_{t-1} + γ(1 - λ^d)e_j e_jᵀ`, cycling `j` across coordinates.
+//! Thus `Γ_t = γI` exactly when `λ = 1`; with `λ < 1`, each live diagonal
+//! coefficient cycles from `γ` down to `γλ^{d-1}` after steady state.
 //!
 //! Each update costs `O(d²)` time via the Sherman–Morrison identity and
 //! performs no heap allocation. The covariance update uses the symmetric
@@ -109,6 +109,9 @@ pub enum Error {
 /// Error from a batch fit or prediction operation.
 #[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
 pub enum BatchError {
+    /// Batch `fit` requires at least one observation.
+    #[error("fit requires at least one observation")]
+    EmptyBatch,
     /// The target slice length does not match the number of feature rows.
     #[error("batch has {expected} feature rows but {got} targets")]
     TargetLengthMismatch {
@@ -204,11 +207,11 @@ impl Builder {
 
     /// Persistent ridge penalty `γ ≥ 0` on `‖θ‖²`. Default `0`.
     ///
-    /// Unlike the `δ⁻¹` prior, this penalty does not decay under forgetting:
-    /// exact at `λ = 1`, maintained at steady-state strength `≈ γ` per
-    /// coordinate for `λ < 1`. Besides shrinking `θ`, it bounds the
-    /// covariance in unexcited directions, so it also acts as wind-up
-    /// protection.
+    /// Unlike the `δ⁻¹` prior, this penalty is continually refreshed under
+    /// forgetting. It is exactly `γI` at `λ = 1`; for `λ < 1`, cycled
+    /// coordinate refreshes make each live coefficient range from `γ` down to
+    /// `γλ^(d-1)` at steady state. Besides shrinking `θ`, it bounds covariance
+    /// in unexcited directions, so it also acts as wind-up protection.
     #[must_use]
     pub fn regularization(mut self, gamma: f64) -> Self {
         self.regularization = gamma;
@@ -274,7 +277,7 @@ impl Builder {
 #[derive(Debug, Clone)]
 #[cfg_attr(
     feature = "serde",
-    derive(serde::Serialize, serde::Deserialize),
+    derive(serde::Deserialize),
     serde(try_from = "EwRlsCheckpoint")
 )]
 pub struct EwRls {
@@ -283,22 +286,56 @@ pub struct EwRls {
     /// Inverse information (covariance) matrix `P` (`d × d`).
     p: DMatrix<f64>,
     /// Workspace for `P·x`, kept to make updates allocation-free.
-    #[cfg_attr(feature = "serde", serde(skip))]
     p_x: DVector<f64>,
     /// Validated candidate covariance diagonal, reused by the fused update.
-    #[cfg_attr(feature = "serde", serde(skip))]
     candidate_diagonal: DVector<f64>,
     /// Conservative upper bound on every `|P[i, j]|`.
-    #[cfg_attr(feature = "serde", serde(skip))]
     p_abs_bound: f64,
     lambda: f64,
     dimensions: usize,
     initial_covariance: f64,
     /// Serialized as `null` when infinite — JSON has no Inf literal.
-    #[cfg_attr(feature = "serde", serde(serialize_with = "serde_inf::serialize"))]
     max_trace: f64,
     gamma: f64,
     updates: u64,
+}
+
+#[cfg(feature = "serde")]
+const CHECKPOINT_VERSION: u32 = 1;
+
+#[cfg(feature = "serde")]
+#[derive(serde::Serialize)]
+struct EwRlsCheckpointRef<'a> {
+    version: u32,
+    theta: &'a DVector<f64>,
+    p: &'a DMatrix<f64>,
+    lambda: f64,
+    dimensions: usize,
+    initial_covariance: f64,
+    #[serde(serialize_with = "serde_inf::serialize")]
+    max_trace: f64,
+    gamma: f64,
+    updates: u64,
+}
+
+#[cfg(feature = "serde")]
+impl serde::Serialize for EwRls {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serde::Serialize::serialize(
+            &EwRlsCheckpointRef {
+                version: CHECKPOINT_VERSION,
+                theta: &self.theta,
+                p: &self.p,
+                lambda: self.lambda,
+                dimensions: self.dimensions,
+                initial_covariance: self.initial_covariance,
+                max_trace: self.max_trace,
+                gamma: self.gamma,
+                updates: self.updates,
+            },
+            serializer,
+        )
+    }
 }
 
 /// (De)serialize a possibly-infinite `f64` through `Option`, since formats
@@ -322,7 +359,7 @@ mod serde_inf {
 
 impl EwRls {
     /// Create a model with `dimensions` features and forgetting factor
-    /// `lambda`, using default initial covariance (`1e3`) and wind-up cap.
+    /// `lambda`, using default initial covariance (`1e3`) and no trace cap.
     ///
     /// Use [`EwRls::builder`] to tune the remaining knobs.
     pub fn new(dimensions: usize, lambda: f64) -> Result<Self, Error> {
@@ -355,13 +392,17 @@ impl EwRls {
     /// full predictive variance. Clamped to be non-negative.
     pub fn prediction_variance(&self, x: &[f64]) -> Result<f64, Error> {
         self.validate_features(x)?;
+        Ok(self.prediction_variance_validated(x))
+    }
+
+    fn prediction_variance_validated(&self, x: &[f64]) -> f64 {
         let xv = DVectorView::from_slice(x, self.dimensions);
         // Walk columns so accesses stay contiguous in the column-major P.
         let mut acc = 0.0;
         for (j, &xj) in x.iter().enumerate() {
             acc += xj * self.p.column(j).dot(&xv);
         }
-        Ok(acc.max(0.0))
+        acc.max(0.0)
     }
 
     /// Update with an observation `(x, y)` of unit weight.
@@ -556,6 +597,9 @@ impl EwRls {
     /// occurs, the successfully processed prefix remains fitted.
     pub fn fit<X: AsRef<[f64]>>(&mut self, x: &[X], y: &[f64]) -> Result<&mut Self, BatchError> {
         self.validate_batch(x, y, None)?;
+        if x.is_empty() {
+            return Err(BatchError::EmptyBatch);
+        }
         self.reset();
         self.apply_validated_batch(x, y, None)
     }
@@ -581,6 +625,9 @@ impl EwRls {
         sample_weight: &[f64],
     ) -> Result<&mut Self, BatchError> {
         self.validate_batch(x, y, Some(sample_weight))?;
+        if x.is_empty() {
+            return Err(BatchError::EmptyBatch);
+        }
         self.reset();
         self.apply_validated_batch(x, y, Some(sample_weight))
     }
@@ -620,13 +667,44 @@ impl EwRls {
                 got: output.len(),
             });
         }
-        for (index, row) in x.iter().enumerate() {
-            self.validate_features(row.as_ref())
-                .map_err(|source| BatchError::Sample { index, source })?;
-        }
+        self.validate_feature_rows(x)?;
         for (row, prediction) in x.iter().zip(output) {
             let row = DVectorView::from_slice(row.as_ref(), self.dimensions);
             *prediction = row.dot(&self.theta);
+        }
+        Ok(())
+    }
+
+    /// Compute predictive variance for every feature row, allocating output.
+    ///
+    /// Use [`EwRls::prediction_variance_batch_into`] to reuse an output buffer
+    /// in a hot path.
+    pub fn prediction_variance_batch<X: AsRef<[f64]>>(
+        &self,
+        x: &[X],
+    ) -> Result<Vec<f64>, BatchError> {
+        let mut output = vec![0.0; x.len()];
+        self.prediction_variance_batch_into(x, &mut output)?;
+        Ok(output)
+    }
+
+    /// Compute predictive variance into a caller-provided output buffer.
+    ///
+    /// The output remains unchanged if a row or the output length is invalid.
+    pub fn prediction_variance_batch_into<X: AsRef<[f64]>>(
+        &self,
+        x: &[X],
+        output: &mut [f64],
+    ) -> Result<(), BatchError> {
+        if output.len() != x.len() {
+            return Err(BatchError::OutputLengthMismatch {
+                expected: x.len(),
+                got: output.len(),
+            });
+        }
+        self.validate_feature_rows(x)?;
+        for (row, variance) in x.iter().zip(output) {
+            *variance = self.prediction_variance_validated(row.as_ref());
         }
         Ok(())
     }
@@ -741,6 +819,14 @@ impl EwRls {
         }
         if !(weight > 0.0 && weight.is_finite()) {
             return Err(Error::InvalidWeight(weight));
+        }
+        Ok(())
+    }
+
+    fn validate_feature_rows<X: AsRef<[f64]>>(&self, x: &[X]) -> Result<(), BatchError> {
+        for (index, row) in x.iter().enumerate() {
+            self.validate_features(row.as_ref())
+                .map_err(|source| BatchError::Sample { index, source })?;
         }
         Ok(())
     }
@@ -881,6 +967,7 @@ fn trace_within_cap(trace: f64, max_trace: f64, dimensions: usize) -> bool {
 #[cfg(feature = "serde")]
 #[derive(serde::Deserialize)]
 struct EwRlsCheckpoint {
+    version: u32,
     theta: DVector<f64>,
     p: DMatrix<f64>,
     lambda: f64,
@@ -897,6 +984,12 @@ impl TryFrom<EwRlsCheckpoint> for EwRls {
     type Error = String;
 
     fn try_from(c: EwRlsCheckpoint) -> Result<Self, String> {
+        if c.version != CHECKPOINT_VERSION {
+            return Err(format!(
+                "unsupported checkpoint version {}; expected {CHECKPOINT_VERSION}",
+                c.version
+            ));
+        }
         let d = c.dimensions;
         if d == 0 {
             return Err("dimensions must be greater than 0".into());
@@ -980,7 +1073,7 @@ impl TryFrom<EwRlsCheckpoint> for EwRls {
         };
         model.symmetrize();
         model.p_abs_bound = model.p.amax();
-        let scale = model.p.amax();
+        let scale = model.p_abs_bound;
         if scale > 0.0 {
             let eigenvalues = (&model.p / scale).symmetric_eigenvalues();
             if eigenvalues.iter().any(|&v| !v.is_finite() || v < -1e-12) {
@@ -1187,6 +1280,20 @@ mod tests {
         let mut output = [f64::NAN; 3];
         model.predict_batch_into(&x, &mut output).unwrap();
         assert_eq!(output, [-1.0, -4.5, 4.0]);
+
+        let expected_variance: Vec<f64> = x
+            .iter()
+            .map(|row| model.prediction_variance(row).unwrap())
+            .collect();
+        assert_eq!(
+            model.prediction_variance_batch(&x).unwrap(),
+            expected_variance
+        );
+        let mut variance_output = [f64::NAN; 3];
+        model
+            .prediction_variance_batch_into(&x, &mut variance_output)
+            .unwrap();
+        assert_eq!(variance_output.as_slice(), expected_variance);
     }
 
     #[test]
@@ -1196,6 +1303,13 @@ mod tests {
         let theta_before = model.params().to_vec();
         let covariance_before = model.covariance().clone();
         let x = [[1.0, 0.0], [f64::NAN, 1.0]];
+
+        assert_eq!(
+            model.fit::<[f64; 2]>(&[], &[]).unwrap_err(),
+            BatchError::EmptyBatch
+        );
+        assert_eq!(model.params(), theta_before);
+        assert_eq!(model.covariance(), &covariance_before);
 
         assert_eq!(
             model.fit(&x, &[1.0, 2.0]).unwrap_err(),
@@ -1533,6 +1647,14 @@ mod tests {
         assert_eq!(restored.params(), model.params());
         assert_eq!(restored.covariance(), model.covariance());
         assert_eq!(restored.updates(), model.updates());
+
+        // The format is explicit and rejects unknown schema versions.
+        assert!(json.contains("\"version\":1"));
+        let unsupported = json.replace("\"version\":1", "\"version\":2");
+        let err = serde_json::from_str::<EwRls>(&unsupported).unwrap_err();
+        assert!(err.to_string().contains("checkpoint version"));
+        let unversioned = json.replacen("\"version\":1,", "", 1);
+        assert!(serde_json::from_str::<EwRls>(&unversioned).is_err());
 
         // Dimensions inconsistent with the stored matrices must be rejected,
         // as must out-of-range configuration.

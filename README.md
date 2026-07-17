@@ -5,14 +5,16 @@ Exponentially-weighted recursive least squares (EW-RLS) for online linear regres
 At each step the model holds the exact minimizer of
 
 ```text
-J_t(θ) = Σ_{i=1..t} λ^{t-i} w_i (y_i − x_iᵀθ)²  +  λ^t δ⁻¹ ‖θ‖²  +  γ ‖θ‖²
+J_t(θ) = Σ_{i=1..t} λ^{t-i} w_i (y_i − x_iᵀθ)²
+         + λ^t δ⁻¹ ‖θ‖² + θᵀΓ_tθ
 ```
 
 where `λ ∈ (0, 1]` is the forgetting factor, `w_i` an optional per-sample
-weight, `δ` the initial covariance (a decaying ridge prior) and `γ` an
-optional persistent L2 penalty (`regularization` in the builder) that holds
-under forgetting — exact at `λ = 1`, maintained via cycled pseudo-observations
-for `λ < 1`. Updates are O(d²) Sherman–Morrison, allocation-free.
+weight, `δ` the initial covariance (a decaying ridge prior), and `Γ_t` optional
+persistent ridge information. Configured by `regularization(γ)`, `Γ_t = γI`
+at `λ = 1`; with forgetting, coordinate refreshes keep each steady-state
+diagonal coefficient between `γλ^(d-1)` and `γ`. Updates are O(d²)
+Sherman–Morrison and allocation-free.
 
 ## Usage
 
@@ -74,7 +76,13 @@ regime change.
 
 ## Features
 
-- `serde` — serialize/deserialize model state.
+- `serde` — serialize/deserialize validated, versioned model checkpoints.
+
+The minimum supported Rust version is 1.97.
+
+## License
+
+Licensed under the [MIT License](LICENSE).
 
 `cargo test` runs closed-form and equivalence checks, `cargo bench` the
 Criterion update/predict benchmarks. `cargo run --example nist_norris`
