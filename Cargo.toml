@@ -1,15 +1,24 @@
 [package]
-name = "wrls"
-version = "0.1.0"
+name = "ewrls"
+version = "0.2.0"
 edition = "2024"
+description = "Exponentially-weighted recursive least squares (EW-RLS) online regression"
+keywords = ["rls", "online-learning", "regression", "adaptive-filter", "streaming"]
+categories = ["algorithms", "mathematics", "science"]
 
 [dependencies]
-nalgebra = "0.34"
-rand = "0.9"
+nalgebra = "0.35"
+thiserror = "2.0"
+serde = { version = "1.0", features = ["derive"], optional = true }
+
+[features]
+serde = ["dep:serde", "nalgebra/serde-serialize"]
 
 [dev-dependencies]
-criterion = { version = "0.6", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
+rand = "0.10"
+serde_json = { version = "1.0", features = ["float_roundtrip"] }
 
 [[bench]]
-name = "wrls_benchmark"
+name = "ewrls_benchmark"
 harness = false
