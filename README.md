@@ -31,6 +31,25 @@ let y_hat = model.predict(&[0.6, 1.0])?;
 # Ok::<(), ewrls::Error>(())
 ```
 
+Batch fitting follows familiar `fit`/`partial_fit` semantics while accepting
+ordinary contiguous Rust rows (`Vec<f64>`, arrays, or slices):
+
+```rust
+use ewrls::EwRls;
+
+let x = [[0.0, 1.0], [1.0, 1.0], [2.0, 1.0]];
+let y = [1.0, 4.0, 7.0];
+let mut model = EwRls::new(2, 0.99)?;
+
+model.fit(&x, &y)?; // resets, then fits the batch
+model.partial_fit(&[[3.0, 1.0]], &[10.0])?; // preserves current state
+
+let predictions = model.predict_batch(&x)?;
+let mut reused = [0.0; 3];
+model.predict_batch_into(&x, &mut reused)?; // allocation-free output path
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
 Effective window is roughly `1/(1−λ)`: 0.99 ≈ 100 samples, 0.95 ≈ 20.
 `λ = 1` is plain RLS and matches the closed-form ridge solution
 `(XᵀX + δ⁻¹I)⁻¹Xᵀy` exactly (tested).

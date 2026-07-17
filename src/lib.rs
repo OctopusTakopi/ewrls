@@ -63,6 +63,8 @@ use nalgebra::{DMatrix, DVector, DVectorView};
 
 /// Re-symmetrize `P` every this many updates to remove rounding drift.
 const SYMMETRIZE_INTERVAL: u64 = 256;
+/// Keep fused covariance intermediates comfortably below overflow.
+const FUSED_UPDATE_LIMIT: f64 = f64::MAX / 4.0;
 
 /// Errors returned by [`EwRls`] construction and updates.
 #[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
@@ -102,6 +104,44 @@ pub enum Error {
     /// [`EwRls::reset`].
     #[error("numerical breakdown: covariance lost positive-definiteness; reset the covariance")]
     NumericalBreakdown,
+}
+
+/// Error from a batch fit or prediction operation.
+#[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
+pub enum BatchError {
+    /// The target slice length does not match the number of feature rows.
+    #[error("batch has {expected} feature rows but {got} targets")]
+    TargetLengthMismatch {
+        /// Number of feature rows.
+        expected: usize,
+        /// Number of supplied targets.
+        got: usize,
+    },
+    /// The weight slice length does not match the number of feature rows.
+    #[error("batch has {expected} feature rows but {got} sample weights")]
+    WeightLengthMismatch {
+        /// Number of feature rows.
+        expected: usize,
+        /// Number of supplied weights.
+        got: usize,
+    },
+    /// The output slice length does not match the number of feature rows.
+    #[error("batch has {expected} feature rows but output has length {got}")]
+    OutputLengthMismatch {
+        /// Number of feature rows.
+        expected: usize,
+        /// Length of the supplied output buffer.
+        got: usize,
+    },
+    /// A particular observation failed validation or numerical updating.
+    #[error("batch sample {index}: {source}")]
+    Sample {
+        /// Zero-based index of the failing observation.
+        index: usize,
+        /// Underlying single-observation error.
+        #[source]
+        source: Error,
+    },
 }
 
 /// Diagnostics produced by a single update, all computed *before* the
@@ -215,6 +255,8 @@ impl Builder {
             theta: DVector::zeros(self.dimensions),
             p,
             p_x: DVector::zeros(self.dimensions),
+            candidate_diagonal: DVector::zeros(self.dimensions),
+            p_abs_bound: p0,
             lambda: self.lambda,
             dimensions: self.dimensions,
             initial_covariance: self.initial_covariance,
@@ -243,6 +285,12 @@ pub struct EwRls {
     /// Workspace for `P·x`, kept to make updates allocation-free.
     #[cfg_attr(feature = "serde", serde(skip))]
     p_x: DVector<f64>,
+    /// Validated candidate covariance diagonal, reused by the fused update.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    candidate_diagonal: DVector<f64>,
+    /// Conservative upper bound on every `|P[i, j]|`.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    p_abs_bound: f64,
     lambda: f64,
     dimensions: usize,
     initial_covariance: f64,
@@ -336,14 +384,16 @@ impl EwRls {
         y: f64,
         weight: f64,
     ) -> Result<UpdateReport, Error> {
-        self.validate_features(x)?;
-        if !y.is_finite() {
-            return Err(Error::NonFiniteInput);
-        }
-        if !(weight > 0.0 && weight.is_finite()) {
-            return Err(Error::InvalidWeight(weight));
-        }
+        self.validate_observation(x, y, weight)?;
+        self.update_weighted_validated(x, y, weight)
+    }
 
+    fn update_weighted_validated(
+        &mut self,
+        x: &[f64],
+        y: f64,
+        weight: f64,
+    ) -> Result<UpdateReport, Error> {
         let x = DVectorView::from_slice(x, self.dimensions);
 
         // p_x = P·x. P is symmetric, so p_xᵀ = xᵀP as well.
@@ -388,16 +438,26 @@ impl EwRls {
             if !tj.is_finite() || !dj.is_finite() || dj < 0.0 {
                 return Err(Error::NumericalBreakdown);
             }
+            self.candidate_diagonal[j] = dj;
             new_trace += dj;
         }
         if !new_trace.is_finite() {
             return Err(Error::NumericalBreakdown);
         }
-        for j in 0..self.dimensions {
-            for i in 0..self.dimensions {
-                let pij = (self.p[(i, j)] - self.p_x[i] * self.p_x[j] * inv_den) / self.lambda;
-                if !pij.is_finite() {
-                    return Err(Error::NumericalBreakdown);
+
+        // Prove nalgebra's fused evaluation safe using a cached bound on all
+        // covariance entries. This avoids an O(d²) validation pass for normal
+        // inputs without relying on P being exactly positive semidefinite.
+        let fused = fused_covariance_bound(self.p_abs_bound, self.p_x.amax(), inv_den, self.lambda);
+        let mut exact_candidate_bound = 0.0_f64;
+        if fused.is_none() {
+            for j in 0..self.dimensions {
+                for i in 0..self.dimensions {
+                    let pij = (self.p[(i, j)] - self.p_x[i] * self.p_x[j] * inv_den) / self.lambda;
+                    if !pij.is_finite() {
+                        return Err(Error::NumericalBreakdown);
+                    }
+                    exact_candidate_bound = exact_candidate_bound.max(pij.abs());
                 }
             }
         }
@@ -408,14 +468,26 @@ impl EwRls {
             self.theta[j] += gain_scale * self.p_x[j];
         }
 
-        // P ← (P − (Px)(Px)ᵀ / den) / λ. Keep exactly the evaluation order
-        // validated above: distributing 1/λ across the subtraction can turn
-        // two overflowing terms that should cancel into NaN.
-        for j in 0..self.dimensions {
-            for i in 0..self.dimensions {
-                self.p[(i, j)] =
-                    (self.p[(i, j)] - self.p_x[i] * self.p_x[j] * inv_den) / self.lambda;
+        if let Some(fused) = fused {
+            // P ← P/λ − (Px)(Px)ᵀ/(den·λ), one SIMD-friendly matrix pass.
+            // The direct, validated diagonal is restored to avoid cancellation
+            // drift from the distributed fused expression.
+            self.p
+                .ger(-fused.alpha_abs, &self.p_x, &self.p_x, fused.beta);
+            for j in 0..self.dimensions {
+                self.p[(j, j)] = self.candidate_diagonal[j];
             }
+            self.p_abs_bound = fused.candidate_bound.max(self.candidate_diagonal.amax());
+        } else {
+            // Cancellation-heavy extreme: preserve the exact evaluation order
+            // validated above, even though it costs a second covariance pass.
+            for j in 0..self.dimensions {
+                for i in 0..self.dimensions {
+                    self.p[(i, j)] =
+                        (self.p[(i, j)] - self.p_x[i] * self.p_x[j] * inv_den) / self.lambda;
+                }
+            }
+            self.p_abs_bound = exact_candidate_bound;
         }
 
         // Persistent ridge refresh: the data step decayed all accumulated
@@ -434,18 +506,20 @@ impl EwRls {
                 let factor = c / den;
                 // Bound the largest θ and P corrections before committing,
                 // multiplying factor into the (often tiny) column first so a
-                // huge γ cannot overflow an intermediate. |P_ik| ≤ trace(P)
-                // for a PSD matrix, so these bounds cover every element; skip
-                // the refresh rather than store a non-finite value.
+                // huge γ cannot overflow an intermediate. The cached absolute
+                // covariance bound covers every element; skip the refresh
+                // rather than store a non-finite value.
                 let theta_j = self.theta[j];
-                let m = factor * self.p_x.amax();
+                let column_max = self.p_x.amax();
+                let m = factor * column_max;
                 let theta_bound = self.theta.amax() + m * theta_j.abs();
-                let p_bound = self.p.trace() + m * self.p_x.amax();
+                let p_bound = inflate_bound(self.p_abs_bound + m * column_max);
                 if theta_bound.is_finite() && p_bound.is_finite() {
                     for i in 0..self.dimensions {
                         self.theta[i] -= (factor * self.p_x[i]) * theta_j;
                     }
                     self.p.ger(-factor, &self.p_x, &self.p_x, 1.0);
+                    self.p_abs_bound = p_bound;
                 }
             }
         }
@@ -453,12 +527,17 @@ impl EwRls {
         // Optional wind-up cap: rescale P if its trace exceeded the cap.
         let trace = self.p.trace();
         if trace > self.max_trace {
-            self.p.scale_mut(self.max_trace / trace);
+            let scale = self.max_trace / trace;
+            self.p.scale_mut(scale);
+            self.p_abs_bound = inflate_bound(self.p_abs_bound * scale);
         }
 
         self.updates += 1;
         if self.updates.is_multiple_of(SYMMETRIZE_INTERVAL) {
             self.symmetrize();
+            // Tighten the conservative bound before repeated triangle bounds
+            // make it unnecessarily force the exact fallback.
+            self.p_abs_bound = self.p.amax();
         }
 
         Ok(UpdateReport {
@@ -466,6 +545,90 @@ impl EwRls {
             residual,
             predictive_variance: quad,
         })
+    }
+
+    /// Reset the model and fit a batch of observations.
+    ///
+    /// Each element of `x` is one contiguous feature row, so this accepts
+    /// idiomatic Rust containers such as `Vec<Vec<f64>>`, `Vec<[f64; N]>`,
+    /// and slices of feature slices without conversion. All inputs are
+    /// validated before the model is reset. If a later numerical breakdown
+    /// occurs, the successfully processed prefix remains fitted.
+    pub fn fit<X: AsRef<[f64]>>(&mut self, x: &[X], y: &[f64]) -> Result<&mut Self, BatchError> {
+        self.validate_batch(x, y, None)?;
+        self.reset();
+        self.apply_validated_batch(x, y, None)
+    }
+
+    /// Incrementally fit a batch without resetting the current model.
+    ///
+    /// On failure, observations before the reported sample index remain
+    /// applied; the failing observation itself leaves model state unchanged.
+    pub fn partial_fit<X: AsRef<[f64]>>(
+        &mut self,
+        x: &[X],
+        y: &[f64],
+    ) -> Result<&mut Self, BatchError> {
+        self.validate_batch(x, y, None)?;
+        self.apply_validated_batch(x, y, None)
+    }
+
+    /// Reset the model and fit a batch with one positive weight per sample.
+    pub fn fit_weighted<X: AsRef<[f64]>>(
+        &mut self,
+        x: &[X],
+        y: &[f64],
+        sample_weight: &[f64],
+    ) -> Result<&mut Self, BatchError> {
+        self.validate_batch(x, y, Some(sample_weight))?;
+        self.reset();
+        self.apply_validated_batch(x, y, Some(sample_weight))
+    }
+
+    /// Incrementally fit a weighted batch without resetting the model.
+    pub fn partial_fit_weighted<X: AsRef<[f64]>>(
+        &mut self,
+        x: &[X],
+        y: &[f64],
+        sample_weight: &[f64],
+    ) -> Result<&mut Self, BatchError> {
+        self.validate_batch(x, y, Some(sample_weight))?;
+        self.apply_validated_batch(x, y, Some(sample_weight))
+    }
+
+    /// Predict one value for every feature row, allocating the result vector.
+    ///
+    /// Use [`EwRls::predict_batch_into`] to reuse an output buffer in a hot
+    /// path.
+    pub fn predict_batch<X: AsRef<[f64]>>(&self, x: &[X]) -> Result<Vec<f64>, BatchError> {
+        let mut output = vec![0.0; x.len()];
+        self.predict_batch_into(x, &mut output)?;
+        Ok(output)
+    }
+
+    /// Predict one value per feature row into a caller-provided buffer.
+    ///
+    /// The output remains unchanged if a row or the output length is invalid.
+    pub fn predict_batch_into<X: AsRef<[f64]>>(
+        &self,
+        x: &[X],
+        output: &mut [f64],
+    ) -> Result<(), BatchError> {
+        if output.len() != x.len() {
+            return Err(BatchError::OutputLengthMismatch {
+                expected: x.len(),
+                got: output.len(),
+            });
+        }
+        for (index, row) in x.iter().enumerate() {
+            self.validate_features(row.as_ref())
+                .map_err(|source| BatchError::Sample { index, source })?;
+        }
+        for (row, prediction) in x.iter().zip(output) {
+            let row = DVectorView::from_slice(row.as_ref(), self.dimensions);
+            *prediction = row.dot(&self.theta);
+        }
+        Ok(())
     }
 
     /// Reset the covariance to `δI`, keeping the learned parameters.
@@ -481,6 +644,7 @@ impl EwRls {
             self.dimensions,
         );
         self.p = DMatrix::identity(self.dimensions, self.dimensions) * p0;
+        self.p_abs_bound = p0;
     }
 
     /// Reset the model to its initial state (`θ = 0`, `P = δI`).
@@ -570,6 +734,60 @@ impl EwRls {
         Ok(())
     }
 
+    fn validate_observation(&self, x: &[f64], y: f64, weight: f64) -> Result<(), Error> {
+        self.validate_features(x)?;
+        if !y.is_finite() {
+            return Err(Error::NonFiniteInput);
+        }
+        if !(weight > 0.0 && weight.is_finite()) {
+            return Err(Error::InvalidWeight(weight));
+        }
+        Ok(())
+    }
+
+    fn validate_batch<X: AsRef<[f64]>>(
+        &self,
+        x: &[X],
+        y: &[f64],
+        sample_weight: Option<&[f64]>,
+    ) -> Result<(), BatchError> {
+        if y.len() != x.len() {
+            return Err(BatchError::TargetLengthMismatch {
+                expected: x.len(),
+                got: y.len(),
+            });
+        }
+        if let Some(weights) = sample_weight
+            && weights.len() != x.len()
+        {
+            return Err(BatchError::WeightLengthMismatch {
+                expected: x.len(),
+                got: weights.len(),
+            });
+        }
+
+        for (index, (row, &target)) in x.iter().zip(y).enumerate() {
+            let weight = sample_weight.map_or(1.0, |weights| weights[index]);
+            self.validate_observation(row.as_ref(), target, weight)
+                .map_err(|source| BatchError::Sample { index, source })?;
+        }
+        Ok(())
+    }
+
+    fn apply_validated_batch<'a, X: AsRef<[f64]>>(
+        &'a mut self,
+        x: &[X],
+        y: &[f64],
+        sample_weight: Option<&[f64]>,
+    ) -> Result<&'a mut Self, BatchError> {
+        for (index, (row, &target)) in x.iter().zip(y).enumerate() {
+            let weight = sample_weight.map_or(1.0, |weights| weights[index]);
+            self.update_weighted_validated(row.as_ref(), target, weight)
+                .map_err(|source| BatchError::Sample { index, source })?;
+        }
+        Ok(self)
+    }
+
     fn symmetrize(&mut self) {
         for i in 0..self.dimensions {
             for j in (i + 1)..self.dimensions {
@@ -594,6 +812,50 @@ fn initial_scale(delta: f64, gamma: f64, max_trace: f64, dimensions: usize) -> f
         delta / (1.0 + gamma * delta)
     };
     p0.min(max_trace / dimensions as f64)
+}
+
+#[derive(Clone, Copy)]
+struct FusedCovarianceUpdate {
+    alpha_abs: f64,
+    beta: f64,
+    candidate_bound: f64,
+}
+
+/// Return the fused GER coefficients only when every intermediate in
+/// `beta·P + (-alpha_abs·p_x)·p_xᵀ` is comfortably finite.
+fn fused_covariance_bound(
+    p_abs_bound: f64,
+    p_x_abs_max: f64,
+    inv_den: f64,
+    lambda: f64,
+) -> Option<FusedCovarianceUpdate> {
+    let beta = 1.0 / lambda;
+    let alpha_abs = inv_den / lambda;
+    let column_factor_bound = alpha_abs * p_x_abs_max;
+    let rank_bound = column_factor_bound * p_x_abs_max;
+    let scaled_p_bound = beta * p_abs_bound;
+    let candidate_bound = scaled_p_bound + rank_bound;
+
+    (beta <= FUSED_UPDATE_LIMIT
+        && alpha_abs <= FUSED_UPDATE_LIMIT
+        && column_factor_bound <= FUSED_UPDATE_LIMIT
+        && rank_bound <= FUSED_UPDATE_LIMIT
+        && scaled_p_bound <= FUSED_UPDATE_LIMIT
+        && candidate_bound <= FUSED_UPDATE_LIMIT)
+        .then_some(FusedCovarianceUpdate {
+            alpha_abs,
+            beta,
+            candidate_bound: inflate_bound(candidate_bound),
+        })
+}
+
+/// Round a computed magnitude bound outward by several ulps.
+fn inflate_bound(bound: f64) -> f64 {
+    if bound == 0.0 {
+        0.0
+    } else {
+        bound * (1.0 + 8.0 * f64::EPSILON)
+    }
 }
 
 /// Sum a uniform diagonal in the same order as `DMatrix::trace` without
@@ -707,6 +969,8 @@ impl TryFrom<EwRlsCheckpoint> for EwRls {
             p: c.p,
             // Workspace is scratch state; always rebuild it.
             p_x: DVector::zeros(d),
+            candidate_diagonal: DVector::zeros(d),
+            p_abs_bound: 0.0,
             lambda: c.lambda,
             dimensions: d,
             initial_covariance: c.initial_covariance,
@@ -715,6 +979,7 @@ impl TryFrom<EwRlsCheckpoint> for EwRls {
             updates: c.updates,
         };
         model.symmetrize();
+        model.p_abs_bound = model.p.amax();
         let scale = model.p.amax();
         if scale > 0.0 {
             let eigenvalues = (&model.p / scale).symmetric_eigenvalues();
@@ -864,6 +1129,111 @@ mod tests {
         assert!(diff < 1e-9, "weighted vs repeated theta differ by {diff}");
         let p_diff = (weighted.covariance() - repeated.covariance()).norm();
         assert!(p_diff < 1e-6, "weighted vs repeated P differ by {p_diff}");
+    }
+
+    #[test]
+    fn batch_fit_and_partial_fit_match_streaming_updates() {
+        let x = [[1.0, 0.0], [0.5, 1.0], [-1.0, 2.0], [2.0, -0.5]];
+        let y = [2.0, 1.5, -0.25, 4.0];
+        let extra_x = [[0.25, -1.0], [1.5, 0.75]];
+        let extra_y = [-1.0, 2.5];
+
+        let mut batch = EwRls::new(2, 0.99).unwrap();
+        batch.fit(&x, &y).unwrap();
+        batch.partial_fit(&extra_x, &extra_y).unwrap();
+
+        let mut streaming = EwRls::new(2, 0.99).unwrap();
+        for (row, &target) in x.iter().zip(&y).chain(extra_x.iter().zip(&extra_y)) {
+            streaming.update(row, target).unwrap();
+        }
+
+        assert_eq!(batch.params(), streaming.params());
+        assert_eq!(batch.covariance(), streaming.covariance());
+        assert_eq!(batch.updates(), 6);
+
+        // `fit` starts a fresh training run.
+        batch.fit(&extra_x, &extra_y).unwrap();
+        let mut fresh = EwRls::new(2, 0.99).unwrap();
+        fresh.partial_fit(&extra_x, &extra_y).unwrap();
+        assert_eq!(batch.params(), fresh.params());
+        assert_eq!(batch.covariance(), fresh.covariance());
+    }
+
+    #[test]
+    fn weighted_batch_matches_weighted_streaming() {
+        let x = vec![vec![1.0, 2.0], vec![-0.5, 1.0], vec![3.0, -1.0]];
+        let y = [3.0, -1.0, 2.0];
+        let weights = [0.5, 2.0, 4.0];
+
+        let mut batch = EwRls::new(2, 1.0).unwrap();
+        batch.fit_weighted(&x, &y, &weights).unwrap();
+
+        let mut streaming = EwRls::new(2, 1.0).unwrap();
+        for ((row, &target), &weight) in x.iter().zip(&y).zip(&weights) {
+            streaming.update_weighted(row, target, weight).unwrap();
+        }
+
+        assert_eq!(batch.params(), streaming.params());
+        assert_eq!(batch.covariance(), streaming.covariance());
+    }
+
+    #[test]
+    fn batch_prediction_supports_owned_and_reused_outputs() {
+        let mut model = EwRls::new(2, 1.0).unwrap();
+        model.theta = DVector::from_vec(vec![2.0, -1.0]);
+        let x = [[1.0, 3.0], [-2.0, 0.5], [0.0, -4.0]];
+
+        assert_eq!(model.predict_batch(&x).unwrap(), vec![-1.0, -4.5, 4.0]);
+        let mut output = [f64::NAN; 3];
+        model.predict_batch_into(&x, &mut output).unwrap();
+        assert_eq!(output, [-1.0, -4.5, 4.0]);
+    }
+
+    #[test]
+    fn batch_errors_are_indexed_and_prevalidation_preserves_state() {
+        let mut model = EwRls::new(2, 0.99).unwrap();
+        model.update(&[1.0, 1.0], 2.0).unwrap();
+        let theta_before = model.params().to_vec();
+        let covariance_before = model.covariance().clone();
+        let x = [[1.0, 0.0], [f64::NAN, 1.0]];
+
+        assert_eq!(
+            model.fit(&x, &[1.0, 2.0]).unwrap_err(),
+            BatchError::Sample {
+                index: 1,
+                source: Error::NonFiniteInput,
+            }
+        );
+        assert_eq!(model.params(), theta_before);
+        assert_eq!(model.covariance(), &covariance_before);
+        assert_eq!(
+            model.partial_fit(&[[1.0, 2.0]], &[]).unwrap_err(),
+            BatchError::TargetLengthMismatch {
+                expected: 1,
+                got: 0,
+            }
+        );
+        assert_eq!(
+            model
+                .partial_fit_weighted(&[[1.0, 2.0]], &[1.0], &[])
+                .unwrap_err(),
+            BatchError::WeightLengthMismatch {
+                expected: 1,
+                got: 0,
+            }
+        );
+
+        let mut output = [7.0];
+        assert_eq!(
+            model
+                .predict_batch_into(&[[1.0, 2.0], [3.0, 4.0]], &mut output)
+                .unwrap_err(),
+            BatchError::OutputLengthMismatch {
+                expected: 2,
+                got: 1,
+            }
+        );
+        assert_eq!(output, [7.0]);
     }
 
     #[test]
@@ -1082,6 +1452,59 @@ mod tests {
         model.update(&[1.0], 1.0).unwrap();
         assert_eq!(model.covariance()[(0, 0)], 0.0);
         assert!(model.covariance_trace().is_finite());
+    }
+
+    #[test]
+    fn fused_covariance_guard_selects_only_safe_updates() {
+        assert!(fused_covariance_bound(1000.0, 1000.0, 1e-3, 0.99).is_some());
+        assert!(fused_covariance_bound(1000.0, 1000.0, 1e-3, 1e-308).is_none());
+        assert!(fused_covariance_bound(f64::MAX, 1.0, 1.0, 1.0).is_none());
+    }
+
+    #[test]
+    fn fused_covariance_matches_direct_formula() {
+        let mut model = EwRls::builder(3)
+            .lambda(0.99)
+            .initial_covariance(100.0)
+            .build()
+            .unwrap();
+        let x = [0.2, -0.4, 0.7];
+        let before = model.covariance().clone();
+        let xv = DVectorView::from_slice(&x, 3);
+        let p_x = &before * xv;
+        let inv_den = 1.0 / (0.99 + xv.dot(&p_x));
+        assert!(fused_covariance_bound(before.amax(), p_x.amax(), inv_den, 0.99).is_some());
+
+        let expected = DMatrix::from_fn(3, 3, |i, j| {
+            (before[(i, j)] - p_x[i] * p_x[j] * inv_den) / 0.99
+        });
+        model.update(&x, 2.0).unwrap();
+
+        let error = (model.covariance() - expected).amax();
+        assert!(error < 1e-12, "fused covariance error {error}");
+        assert!(model.p_abs_bound >= model.covariance().amax());
+    }
+
+    #[test]
+    fn covariance_absolute_bound_remains_conservative() {
+        let mut model = EwRls::builder(8)
+            .lambda(0.97)
+            .regularization(0.2)
+            .max_covariance_trace(1e4)
+            .build()
+            .unwrap();
+        let mut rng = rand::rng();
+
+        for _ in 0..2000 {
+            let x: Vec<f64> = (0..8).map(|_| rng.random_range(-2.0..2.0)).collect();
+            model.update(&x, rng.random_range(-10.0..10.0)).unwrap();
+            assert!(
+                model.covariance().amax() <= model.p_abs_bound,
+                "actual {} exceeds cached bound {}",
+                model.covariance().amax(),
+                model.p_abs_bound
+            );
+        }
     }
 
     #[test]
