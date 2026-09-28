@@ -1,25 +1,36 @@
 //! Exponentially-weighted recursive least squares (EW-RLS) online regression.
 //!
-//! At every step `t` the model holds the exact minimizer of
+//! After every update the model holds the exact minimizer of
 //!
 //! ```text
-//! J_t(θ) = Σ_{i=1..t} λ^{t-i} w_i (y_i - x_iᵀθ)²
-//!          + λ^t δ⁻¹ ‖θ‖² + θᵀΓ_tθ
+//! J_t(θ) = Σ_{i=1..t} Λ_{i,t} w_i (y_i - x_iᵀθ)²
+//!          + Λ_{0,t} δ⁻¹ ‖θ‖² + θᵀΓ_tθ
 //! ```
 //!
-//! where `λ ∈ (0, 1]` is the forgetting factor, `w_i > 0` is an optional
-//! per-observation weight, `δ` is the initial covariance scale (a ridge
-//! prior: large `δ` means a weak prior on `θ = 0`), and `Γ_t` is the optional
-//! persistent ridge information. Given configured strength `γ ≥ 0`, it obeys
-//! `Γ_0 = γI` and
-//! `Γ_t = λΓ_{t-1} + γ(1 - λ^d)e_j e_jᵀ`, cycling `j` across coordinates.
-//! Thus `Γ_t = γI` exactly when `λ = 1`; with `λ < 1`, each live diagonal
-//! coefficient cycles from `γ` down to `γλ^{d-1}` after steady state.
+//! where `Λ_{i,t}` is the product of every forgetting factor applied after
+//! observation `i` — the `λ` of each later update ([`EwRls::set_lambda`]) and
+//! every [`EwRls::decay`] call — `w_i > 0` is an optional per-observation
+//! weight, `δ` is the initial covariance scale (a prior on `θ = 0` that is
+//! forgotten with the data; large `δ` means a weak prior), and `Γ_t` is the
+//! optional persistent ridge ([`Ridge`]). With a constant `λ` and no `decay`
+//! calls, `Λ_{i,t} = λ^{t-i}` and this is the textbook
+//! `Σ λ^{t-i} w_i (y_i - x_iᵀθ)² + λ^t δ⁻¹‖θ‖² + θᵀΓ_tθ`.
+//!
+//! `Γ_t` is diagonal and is forgotten with the data, but every update tops
+//! one coordinate `j` (cycling through all `d`) back up to its target:
+//! `γ·s_j` for [`Ridge::Absolute`], or `κ·W_t·s_j` for [`Ridge::Relative`],
+//! where `W_t` is the discounted sample mass ([`EwRls::weight_mass`]) and
+//! `s_j ≥ 0` a per-coordinate weight ([`Builder::ridge_weights`]; `0` leaves
+//! a coordinate such as an intercept unpenalized). Right after its refresh a
+//! coordinate holds exactly its target, and in between it has been forgotten
+//! by at most `d − 1` updates, for any sequence of forgetting factors. With
+//! `λ = 1`, no `decay` calls and an absolute ridge, `Γ_t = γ·diag(s)` exactly.
 //!
 //! Each update costs `O(d²)` time via the Sherman–Morrison identity and
-//! performs no heap allocation. The covariance update uses the symmetric
-//! rank-1 form `P ← (P − (Px)(Px)ᵀ/den)/λ`, which preserves symmetry up to
-//! rounding; residual drift is removed by periodic re-symmetrization.
+//! performs no heap allocation. The covariance update
+//! `P ← (P − (Px)(Px)ᵀ/den)/λ` is evaluated with bit-for-bit symmetric
+//! rank-1 terms, so `P` stays exactly symmetric: rounding asymmetry, which
+//! forgetting would amplify by `1/λ` per update, never arises.
 //!
 //! Safeguards over a naive textbook implementation:
 //!
@@ -27,15 +38,62 @@
 //!   (dimension checks, non-finite rejection),
 //! - covariance **wind-up protection**: with `λ < 1` and weakly exciting
 //!   inputs, `P` grows exponentially in unexcited directions. A persistent
-//!   ridge ([`Builder::regularization`]) bounds it consistently with the
-//!   objective; a hard trace cap ([`Builder::max_covariance_trace`]) is also
+//!   ridge ([`Builder::regularization`], [`Builder::ridge`]) bounds it
+//!   consistently with the objective. Whatever the ridge, forgetting
+//!   saturates at the prior (stabilized forgetting): once a coordinate's
+//!   variance exceeds `2δ`, information `1/δ − 1/P_jj` is added back on it
+//!   as a pseudo-observation at the current `θ_j`, so `P_jj` returns to `δ`
+//!   and `θ` is unchanged. Each such step adds a prior term centred on the
+//!   estimate at the time to `J_t`; with `λ = 1` and no `decay` it never
+//!   happens. A hard trace cap ([`Builder::max_covariance_trace`]) is also
 //!   available but off by default, since capping biases the estimator away
 //!   from the exact minimizer of `J_t`,
-//! - **numerical breakdown detection**: a covariance that has lost positive
-//!   definiteness is reported as [`Error::NumericalBreakdown`] rather than
-//!   silently corrupting `θ`; recover with [`EwRls::reset_covariance`],
-//! - per-update diagnostics ([`UpdateReport`]): a-priori prediction, residual
-//!   and predictive variance `xᵀPx`, usable for residual z-scoring.
+//! - **bounded forgetting per step**: one step with factor `λ` inflates `P`
+//!   by `1/λ`, and later updates must cancel that inflation, losing about
+//!   `log₁₀(1/λ)` digits. Past what `f64` can resolve, the covariance form
+//!   silently loses positive definiteness. So `λ` must be at least
+//!   [`MIN_LAMBDA`], and [`EwRls::decay`] treats a smaller product of decays
+//!   since the last update (a long feed gap) as complete forgetting: it
+//!   resets `P` to the prior and keeps `θ`. Forgetting that accumulates
+//!   across updates carrying little information along some coordinate (zero
+//!   rows, sparse features) is bounded by the prior floor above,
+//! - **numerical breakdown detection**: an observation whose update would
+//!   produce a non-finite state or a negative variance is rejected with
+//!   [`Error::NumericalBreakdown`] before any state is modified. Definiteness
+//!   is only checked along the observed direction, which is why forgetting is
+//!   bounded above,
+//! - per-update diagnostics ([`UpdateReport`]): a-priori prediction, residual,
+//!   `xᵀPx` and the innovation variance scale, usable for residual z-scoring
+//!   and for rejecting outliers before they are applied
+//!   ([`EwRls::update_weighted_if`]).
+//!
+//! # Time-based forgetting
+//!
+//! For irregularly spaced observations, keep `λ = 1` per update and forget
+//! by elapsed time with [`EwRls::decay`] (half-life `τ`: factor
+//! `2^(−Δt/τ)`). A long gap simply resets the confidence to the prior:
+//!
+//! ```
+//! use ewrls::{EwRls, Ridge};
+//!
+//! let mut model = EwRls::builder(3)
+//!     .lambda(1.0)
+//!     .ridge(Ridge::Relative(0.1)) // shrinkage proportional to recent data
+//!     .ridge_weights(&[0.0, 1.0, 1.0]) // column 0 is an unpenalized intercept
+//!     .build()?;
+//! let half_life = 3600.0; // seconds
+//! let mut last = 0.0;
+//! for (t, x, y) in [
+//!     (0.0, [1.0, 0.2, -0.1], 0.3),
+//!     (0.5, [1.0, 0.1, 0.4], -0.2),
+//!     (86_400.0, [1.0, -0.3, 0.2], 0.1), // after a one-day gap
+//! ] {
+//!     model.decay(0.5_f64.powf((t - last) / half_life))?;
+//!     last = t;
+//!     model.update(&x, y)?;
+//! }
+//! # Ok::<(), ewrls::Error>(())
+//! ```
 //!
 //! # Example
 //!
@@ -61,30 +119,55 @@
 
 use nalgebra::{DMatrix, DVector, DVectorView};
 
-/// Re-symmetrize `P` every this many updates to remove rounding drift.
-const SYMMETRIZE_INTERVAL: u64 = 256;
+/// Recompute the exact covariance bound every this many updates.
+const BOUND_REFRESH_INTERVAL: u64 = 256;
 /// Keep fused covariance intermediates comfortably below overflow.
 const FUSED_UPDATE_LIMIT: f64 = f64::MAX / 4.0;
 
+/// Smallest forgetting accepted between two updates.
+///
+/// Forgetting by a factor `f` inflates the covariance by `1/f`, and the
+/// following updates must cancel that inflation, losing about `log₁₀(1/f)`
+/// significant digits (more in ill-conditioned directions). Below about
+/// `1e-8` the covariance form can silently lose positive definiteness and
+/// corrupt `θ`; a factor of `1e-6` keeps a millionth of the old information.
+/// [`EwRls::set_lambda`] and [`Builder::lambda`] therefore reject smaller
+/// values, and [`EwRls::decay`] treats a smaller product of decays since the
+/// last update as complete forgetting.
+///
+/// This bounds one step only. Forgetting accumulated over updates that carry
+/// little information along some coordinate (zero rows, sparse features, a
+/// decay followed by a small `λ`) is bounded separately: no coordinate's
+/// variance stays above twice the prior `δ` (see the crate-level
+/// safeguards).
+pub const MIN_LAMBDA: f64 = 1e-6;
+
 /// Errors returned by [`EwRls`] construction and updates.
 #[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     /// The model must have at least one feature dimension.
     #[error("dimensions must be greater than 0")]
     ZeroDimensions,
-    /// The forgetting factor must satisfy `0 < lambda <= 1`.
-    #[error("forgetting factor lambda must be in (0, 1], got {0}")]
+    /// The forgetting factor must satisfy [`MIN_LAMBDA`] `<= lambda <= 1`.
+    #[error("forgetting factor lambda must be in [{min}, 1], got {0}", min = MIN_LAMBDA)]
     InvalidLambda(f64),
-    /// The initial covariance scale must be positive and finite.
+    /// A [`EwRls::decay`] factor must satisfy `0 <= factor <= 1`.
+    #[error("decay factor must be in [0, 1], got {0}")]
+    InvalidDecay(f64),
+    /// The initial covariance scale must be positive and finite, and so must
+    /// the trace of the prior it gives with the ridge at zero data.
     #[error("initial covariance must be positive and finite, got {0}")]
     InvalidInitialCovariance(f64),
     /// The covariance trace cap must be positive.
     #[error("max covariance trace must be positive, got {0}")]
     InvalidMaxTrace(f64),
-    /// The ridge penalty must be non-negative and finite.
+    /// The ridge strength and every ridge weight must be non-negative and
+    /// finite, as must their products.
     #[error("regularization must be non-negative and finite, got {0}")]
     InvalidRegularization(f64),
-    /// The input vector length does not match the model dimensions.
+    /// The input vector (or ridge weight vector) length does not match the
+    /// model dimensions.
     #[error("input has {got} features but model expects {expected}")]
     DimensionMismatch {
         /// Number of features the model was built with.
@@ -98,16 +181,23 @@ pub enum Error {
     /// A per-sample weight must be positive and finite.
     #[error("sample weight must be positive and finite, got {0}")]
     InvalidWeight(f64),
-    /// Applying the observation would lose covariance positive-definiteness
-    /// or overflow; the observation is rejected and the model state is
-    /// unchanged. Recover with [`EwRls::reset_covariance`] or
+    /// Applying the observation would produce a non-finite parameter,
+    /// covariance entry or trace, or a negative variance; the observation is
+    /// rejected and the model state is unchanged.
+    ///
+    /// Definiteness is only checked along the observed direction, so a
+    /// streak of these errors means the covariance is already unhealthy:
+    /// recover with [`EwRls::reset_covariance`] (keeps `θ`) or
     /// [`EwRls::reset`].
-    #[error("numerical breakdown: covariance lost positive-definiteness; reset the covariance")]
+    #[error(
+        "numerical breakdown: the update would produce a non-finite or indefinite state; observation rejected"
+    )]
     NumericalBreakdown,
 }
 
 /// Error from a batch fit or prediction operation.
 #[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
+#[non_exhaustive]
 pub enum BatchError {
     /// Batch `fit` requires at least one observation.
     #[error("fit requires at least one observation")]
@@ -149,15 +239,77 @@ pub enum BatchError {
 
 /// Diagnostics produced by a single update, all computed *before* the
 /// parameters were adjusted (a-priori quantities).
+///
+/// With observation noise variance `σ²` (per unit weight), the a-priori
+/// residual has variance `σ²·innovation_scale` when `θ` is modelled as a
+/// random walk (the Kalman reading of forgetting). For a fixed `θ` it is
+/// `σ²·(1/w + c·predictive_variance)`, with `c = 1` at `λ = 1` and
+/// `c ≈ 1/(1 + λ)` in the steady state of a constant `λ < 1` with stationary
+/// inputs. For residual z-scoring use `residual / sqrt(σ̂²·innovation_scale)`
+/// or the fixed-`θ` variance.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub struct UpdateReport {
     /// A-priori prediction `xᵀθ` using the parameters before this update.
     pub prediction: f64,
     /// A-priori residual `y − xᵀθ` (the innovation).
     pub residual: f64,
-    /// Predictive variance scale `xᵀPx` before this update. For residual
-    /// z-scoring use `residual / sqrt(predictive_variance + noise_variance)`.
+    /// `xᵀPx` before this update: the parameter uncertainty in the direction
+    /// of `x`, in units of the noise variance `σ²`.
     pub predictive_variance: f64,
+    /// `1/w + xᵀPx/λ`: the innovation variance in units of `σ²` under the
+    /// random-walk reading of forgetting.
+    pub innovation_scale: f64,
+}
+
+/// Persistent ridge penalty on `θ`, kept up to date under forgetting.
+///
+/// Coordinate `j`'s penalty is topped up to its target once every `d`
+/// updates, where the target is scaled by the ridge weight `s_j`
+/// ([`Builder::ridge_weights`], default `1`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[non_exhaustive]
+pub enum Ridge {
+    /// Target `γ·s_j`, fixed in absolute terms (`γ ≥ 0`). With `λ = 1` this is
+    /// the classic ridge `(XᵀX + (δ⁻¹ + γ)I)⁻¹Xᵀy`.
+    Absolute(f64),
+    /// Target `κ·W_t·s_j`, proportional to the discounted sample mass `W_t`
+    /// ([`EwRls::weight_mass`]), so the shrinkage per unit of data stays at
+    /// `κ` when activity or the forgetting rate changes (`κ ≥ 0`). The target
+    /// follows `W_t` within `d` updates.
+    Relative(f64),
+}
+
+impl Ridge {
+    /// The configured strength (`γ` or `κ`).
+    #[must_use]
+    pub fn strength(self) -> f64 {
+        match self {
+            Ridge::Absolute(strength) | Ridge::Relative(strength) => strength,
+        }
+    }
+
+    fn validate(self) -> Result<Self, Error> {
+        let strength = self.strength();
+        if strength >= 0.0 && strength.is_finite() {
+            Ok(self)
+        } else {
+            Err(Error::InvalidRegularization(strength))
+        }
+    }
+}
+
+/// What [`EwRls::decay`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DecayOutcome {
+    /// The information was scaled by the factor (`P ← P/factor`).
+    Applied,
+    /// The product of the decays since the last update fell below
+    /// [`MIN_LAMBDA`] (or `P/factor` would overflow): the covariance was reset to the prior, keeping `θ`, as by
+    /// [`EwRls::reset_covariance`].
+    Reset,
 }
 
 /// Builder for [`EwRls`] with optional knobs beyond [`EwRls::new`].
@@ -167,25 +319,34 @@ pub struct Builder {
     lambda: f64,
     initial_covariance: f64,
     max_covariance_trace: Option<f64>,
-    regularization: f64,
+    ridge: Ridge,
+    ridge_weights: Option<Vec<f64>>,
 }
 
 impl Builder {
-    /// Forgetting factor `λ ∈ (0, 1]`. Default `0.99`.
+    /// Forgetting factor `λ ∈ [MIN_LAMBDA, 1]` applied by every update.
+    /// Default `0.99`.
     ///
     /// The effective sample window is roughly `1 / (1 − λ)`; `λ = 1` weights
-    /// all history equally (plain recursive least squares).
+    /// all history equally (plain recursive least squares). For irregularly
+    /// spaced observations use `λ = 1` with time-based [`EwRls::decay`].
     #[must_use]
     pub fn lambda(mut self, lambda: f64) -> Self {
         self.lambda = lambda;
         self
     }
 
-    /// Initial covariance scale `δ`: `P₀ = δI`. Default `1e3`.
+    /// Initial covariance scale `δ`. Default `1e3`.
     ///
     /// Equivalent to a ridge penalty `δ⁻¹‖θ‖²` on the discounted cost; large
     /// values mean low confidence in the zero initialization and fast initial
-    /// adaptation.
+    /// adaptation. The prior covariance is `P₀ = diag((δ⁻¹ + g_j)⁻¹)`, where
+    /// `g_j` is the ridge penalty on coordinate `j` at zero data (`γ·s_j` for
+    /// an absolute ridge, `0` for a relative one), rescaled if it exceeds
+    /// [`Builder::max_covariance_trace`].
+    ///
+    /// `δ` also sets the stabilized-forgetting floor: forgetting never leaves
+    /// a coordinate's variance above `2δ`; it is pulled back to `δ`.
     #[must_use]
     pub fn initial_covariance(mut self, delta: f64) -> Self {
         self.initial_covariance = delta;
@@ -198,34 +359,56 @@ impl Builder {
     /// including at initialization and on reset — `P` is rescaled to meet it.
     /// Rescaling biases the estimator away from the exact minimizer of `J_t`,
     /// so prefer [`Builder::regularization`], which bounds `P` consistently
-    /// with the objective.
+    /// with the objective. A binding cap also suspends forgetting, since it
+    /// shrinks `P` in informed directions too, while the prior floor
+    /// ([`Builder::initial_covariance`]) already bounds wind-up per
+    /// coordinate.
     #[must_use]
     pub fn max_covariance_trace(mut self, max_trace: f64) -> Self {
         self.max_covariance_trace = Some(max_trace);
         self
     }
 
-    /// Persistent ridge penalty `γ ≥ 0` on `‖θ‖²`. Default `0`.
+    /// Persistent absolute ridge penalty `γ ≥ 0` on `‖θ‖²`; shorthand for
+    /// `ridge(Ridge::Absolute(gamma))`. Default `0`.
     ///
-    /// Unlike the `δ⁻¹` prior, this penalty is continually refreshed under
-    /// forgetting. It is exactly `γI` at `λ = 1`; for `λ < 1`, cycled
-    /// coordinate refreshes make each live coefficient range from `γ` down to
-    /// `γλ^(d-1)` at steady state. Besides shrinking `θ`, it bounds covariance
-    /// in unexcited directions, so it also acts as wind-up protection.
+    /// Unlike the `δ⁻¹` prior, this penalty is kept up to date under
+    /// forgetting. It is exactly `γ·diag(s)` at `λ = 1`; with forgetting,
+    /// each coordinate is topped back up to `γ·s_j` once every `d` updates,
+    /// so it ranges from `γ·s_j` down to `γ·s_j` times the forgetting of the
+    /// last `d − 1` updates (`γλ^(d−1)` for a constant `λ`), and its mean is
+    /// `ργ` with `ρ = (1 − λᵈ)/(d(1 − λ))`. Besides shrinking `θ`, it bounds
+    /// the covariance in unexcited directions, so it also acts as wind-up
+    /// protection.
     #[must_use]
-    pub fn regularization(mut self, gamma: f64) -> Self {
-        self.regularization = gamma;
+    pub fn regularization(self, gamma: f64) -> Self {
+        self.ridge(Ridge::Absolute(gamma))
+    }
+
+    /// Persistent ridge penalty, absolute or relative to the discounted
+    /// sample mass. Default `Ridge::Absolute(0.0)`.
+    #[must_use]
+    pub fn ridge(mut self, ridge: Ridge) -> Self {
+        self.ridge = ridge;
+        self
+    }
+
+    /// Per-coordinate ridge weights `s_j ≥ 0`, one per feature. Default all
+    /// `1`. A weight of `0` leaves that coordinate unpenalized (e.g. an
+    /// intercept column); it still gets the `δ⁻¹` prior.
+    #[must_use]
+    pub fn ridge_weights(mut self, weights: &[f64]) -> Self {
+        self.ridge_weights = Some(weights.to_vec());
         self
     }
 
     /// Validate the configuration and build the model.
     pub fn build(self) -> Result<EwRls, Error> {
-        if self.dimensions == 0 {
+        let d = self.dimensions;
+        if d == 0 {
             return Err(Error::ZeroDimensions);
         }
-        if !(self.lambda > 0.0 && self.lambda <= 1.0) {
-            return Err(Error::InvalidLambda(self.lambda));
-        }
+        validate_lambda(self.lambda)?;
         if !(self.initial_covariance > 0.0 && self.initial_covariance.is_finite()) {
             return Err(Error::InvalidInitialCovariance(self.initial_covariance));
         }
@@ -233,53 +416,60 @@ impl Builder {
         if max_trace.is_nan() || max_trace <= 0.0 {
             return Err(Error::InvalidMaxTrace(max_trace));
         }
-        if !(self.regularization >= 0.0 && self.regularization.is_finite()) {
-            return Err(Error::InvalidRegularization(self.regularization));
-        }
+        let ridge_weights = match self.ridge_weights {
+            Some(weights) if weights.len() != d => {
+                return Err(Error::DimensionMismatch {
+                    expected: d,
+                    got: weights.len(),
+                });
+            }
+            Some(weights) => DVector::from_vec(weights),
+            None => DVector::from_element(d, 1.0),
+        };
+        let ridge = validate_ridge(self.ridge, &ridge_weights)?;
 
-        // The γ ridge starts in the initial information matrix:
-        // P₀ = (δ⁻¹I + γI)⁻¹. Exact and permanent at λ = 1; for λ < 1 the
-        // per-update refresh below keeps it from decaying. The trace cap
-        // applies from the start.
-        let p0 = initial_scale(
-            self.initial_covariance,
-            self.regularization,
-            max_trace,
-            self.dimensions,
-        );
-        let p = DMatrix::identity(self.dimensions, self.dimensions) * p0;
-        // A per-entry scale can be finite while summing the stored diagonal
-        // overflows. Check the matrix using the same order as `trace()`.
-        if !p.trace().is_finite() {
-            return Err(Error::InvalidInitialCovariance(self.initial_covariance));
-        }
-
-        Ok(EwRls {
-            theta: DVector::zeros(self.dimensions),
-            p,
-            p_x: DVector::zeros(self.dimensions),
-            candidate_diagonal: DVector::zeros(self.dimensions),
-            p_abs_bound: p0,
+        let mut model = EwRls {
+            theta: DVector::zeros(d),
+            p: DMatrix::zeros(d, d),
+            p_x: DVector::zeros(d),
+            candidate_diagonal: DVector::zeros(d),
+            p_abs_bound: 0.0,
             lambda: self.lambda,
-            dimensions: self.dimensions,
+            dimensions: d,
             initial_covariance: self.initial_covariance,
             max_trace,
-            gamma: self.regularization,
+            ridge,
+            ridge_weights,
+            ridge_information: DVector::zeros(d),
+            weight_mass: 0.0,
+            pending_decay: 1.0,
             updates: 0,
-        })
+        };
+        // The ridge starts in the prior information matrix,
+        // P₀ = diag((δ⁻¹ + g_j)⁻¹). The trace cap applies from the start.
+        model.reset_covariance();
+        // A per-entry scale can be finite while summing the stored diagonal
+        // overflows. Check the matrix using the same order as `trace()`.
+        if !model.p.trace().is_finite() {
+            return Err(Error::InvalidInitialCovariance(self.initial_covariance));
+        }
+        Ok(model)
     }
 }
 
 /// Exponentially-weighted recursive least squares regressor.
 ///
 /// See the [crate-level documentation](crate) for the model definition,
-/// numerical safeguards and a usage example.
+/// numerical safeguards and usage examples.
+///
+/// With the `serde` feature the model (de)serializes as a validated,
+/// versioned checkpoint (format version 2) that restores bit-exactly: the
+/// restored model continues exactly like the original. With `serde_json`,
+/// enable its `float_roundtrip` feature (or use a binary format), since the
+/// default float parser does not round-trip every `f64`. Version 1
+/// checkpoints (ewrls 0.2) still load; their ridge state and sample mass are
+/// reconstructed assuming unit weights and a constant `λ`.
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    feature = "serde",
-    derive(serde::Deserialize),
-    serde(try_from = "EwRlsCheckpoint")
-)]
 pub struct EwRls {
     /// Parameter vector `θ` (`d × 1`).
     theta: DVector<f64>,
@@ -296,12 +486,24 @@ pub struct EwRls {
     initial_covariance: f64,
     /// Serialized as `null` when infinite — JSON has no Inf literal.
     max_trace: f64,
-    gamma: f64,
+    ridge: Ridge,
+    /// Per-coordinate ridge weights `s_j`.
+    ridge_weights: DVector<f64>,
+    /// Ridge penalty currently held by each coordinate (the diagonal of
+    /// `Γ_t`), forgotten with the data and topped up by the refresh.
+    ridge_information: DVector<f64>,
+    /// Discounted sample mass `W_t = Σ Λ_{i,t} w_i`, saturating at `f64::MAX`.
+    weight_mass: f64,
+    /// Product of the [`EwRls::decay`] factors applied since the last
+    /// committed update (1 right after one), bounded below by [`MIN_LAMBDA`].
+    pending_decay: f64,
     updates: u64,
 }
 
+/// Checkpoint format written by this version. Version 1 checkpoints
+/// (ewrls ≤ 0.2.0) are still accepted, see [`EwRls`]'s `Deserialize` notes.
 #[cfg(feature = "serde")]
-const CHECKPOINT_VERSION: u32 = 1;
+const CHECKPOINT_VERSION: u32 = 2;
 
 #[cfg(feature = "serde")]
 #[derive(serde::Serialize)]
@@ -314,10 +516,19 @@ struct EwRlsCheckpointRef<'a> {
     initial_covariance: f64,
     #[serde(serialize_with = "serde_inf::serialize")]
     max_trace: f64,
-    gamma: f64,
+    ridge: Ridge,
+    ridge_weights: &'a DVector<f64>,
+    ridge_information: &'a DVector<f64>,
+    weight_mass: f64,
+    pending_decay: f64,
+    p_abs_bound: f64,
     updates: u64,
 }
 
+/// Serializes a versioned checkpoint that restores bit-exactly: a restored
+/// model continues exactly like the original. With `serde_json`, enable its
+/// `float_roundtrip` feature (or use a binary format): the default float
+/// parser does not round-trip every `f64`.
 #[cfg(feature = "serde")]
 impl serde::Serialize for EwRls {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -330,7 +541,12 @@ impl serde::Serialize for EwRls {
                 dimensions: self.dimensions,
                 initial_covariance: self.initial_covariance,
                 max_trace: self.max_trace,
-                gamma: self.gamma,
+                ridge: self.ridge,
+                ridge_weights: &self.ridge_weights,
+                ridge_information: &self.ridge_information,
+                weight_mass: self.weight_mass,
+                pending_decay: self.pending_decay,
+                p_abs_bound: self.p_abs_bound,
                 updates: self.updates,
             },
             serializer,
@@ -374,7 +590,8 @@ impl EwRls {
             lambda: 0.99,
             initial_covariance: 1e3,
             max_covariance_trace: None,
-            regularization: 0.0,
+            ridge: Ridge::Absolute(0.0),
+            ridge_weights: None,
         }
     }
 
@@ -387,9 +604,12 @@ impl EwRls {
 
     /// Predictive variance scale `xᵀPx` for a feature vector.
     ///
-    /// Proportional to the model's parameter uncertainty in the direction of
-    /// `x`; combine with an estimate of the observation noise variance for a
-    /// full predictive variance. Clamped to be non-negative.
+    /// The parameter uncertainty in the direction of `x`, in units of the
+    /// observation noise variance `σ²`. For a fixed `θ` the variance of the
+    /// prediction `xᵀθ` is `σ²·xᵀPx` at `λ = 1`, and about `σ²·xᵀPx/(1 + λ)`
+    /// in the steady state of a constant `λ < 1` with stationary inputs;
+    /// under the random-walk reading of forgetting, the one-step-ahead
+    /// variance is `σ²·xᵀPx/λ`. Clamped to be non-negative.
     pub fn prediction_variance(&self, x: &[f64]) -> Result<f64, Error> {
         self.validate_features(x)?;
         Ok(self.prediction_variance_validated(x))
@@ -429,12 +649,56 @@ impl EwRls {
         self.update_weighted_validated(x, y, weight)
     }
 
+    /// Like [`EwRls::update`], but `accept` sees the a-priori
+    /// [`UpdateReport`] first and can veto the observation.
+    ///
+    /// See [`EwRls::update_weighted_if`].
+    pub fn update_if<F: FnOnce(&UpdateReport) -> bool>(
+        &mut self,
+        x: &[f64],
+        y: f64,
+        accept: F,
+    ) -> Result<Option<UpdateReport>, Error> {
+        self.update_weighted_if(x, y, 1.0, accept)
+    }
+
+    /// Like [`EwRls::update_weighted`], but `accept` sees the a-priori
+    /// [`UpdateReport`] before anything is committed and can veto the
+    /// observation, e.g. a bad tick whose residual z-score is too large.
+    ///
+    /// Returns `Ok(None)` when vetoed; the model state is then unchanged
+    /// (the update's forgetting is not applied either). The report costs
+    /// nothing extra: it is computed by every update anyway.
+    pub fn update_weighted_if<F: FnOnce(&UpdateReport) -> bool>(
+        &mut self,
+        x: &[f64],
+        y: f64,
+        weight: f64,
+        accept: F,
+    ) -> Result<Option<UpdateReport>, Error> {
+        self.validate_observation(x, y, weight)?;
+        let innovation = self.innovation(x, y, weight)?;
+        if !accept(&innovation.report) {
+            return Ok(None);
+        }
+        self.commit(&innovation)?;
+        Ok(Some(innovation.report))
+    }
+
     fn update_weighted_validated(
         &mut self,
         x: &[f64],
         y: f64,
         weight: f64,
     ) -> Result<UpdateReport, Error> {
+        let innovation = self.innovation(x, y, weight)?;
+        self.commit(&innovation)?;
+        Ok(innovation.report)
+    }
+
+    /// The a-priori half of an update: computes `P·x` into the workspace and
+    /// the innovation. Modifies no model state.
+    fn innovation(&mut self, x: &[f64], y: f64, weight: f64) -> Result<Innovation, Error> {
         let x = DVectorView::from_slice(x, self.dimensions);
 
         // p_x = P·x. P is symmetric, so p_xᵀ = xᵀP as well.
@@ -465,13 +729,36 @@ impl EwRls {
             return Err(Error::NumericalBreakdown);
         }
 
+        Ok(Innovation {
+            report: UpdateReport {
+                prediction,
+                residual,
+                predictive_variance: quad,
+                innovation_scale: denominator / self.lambda,
+            },
+            inv_den: 1.0 / denominator,
+            gain_scale,
+            weight,
+        })
+    }
+
+    /// The committing half of an update, using the `P·x` workspace left by
+    /// [`EwRls::innovation`]. Validates the whole candidate state first, so
+    /// an error leaves the model unchanged.
+    fn commit(&mut self, innovation: &Innovation) -> Result<(), Error> {
+        let Innovation {
+            inv_den,
+            gain_scale,
+            weight,
+            ..
+        } = *innovation;
+
         // Validate the full candidate state before committing anything: every
         // new parameter and covariance entry must stay finite, every new
         // covariance diagonal must be non-negative, and its trace must not
         // overflow.
         // Otherwise the observation has exhausted f64 precision (or
         // overflowed 1/λ) and is rejected with the state untouched.
-        let inv_den = 1.0 / denominator;
         let mut new_trace = 0.0;
         for j in 0..self.dimensions {
             let tj = self.theta[j] + gain_scale * self.p_x[j];
@@ -510,11 +797,16 @@ impl EwRls {
         }
 
         if let Some(fused) = fused {
-            // P ← P/λ − (Px)(Px)ᵀ/(den·λ), one SIMD-friendly matrix pass.
-            // The direct, validated diagonal is restored to avoid cancellation
+            // P ← P/λ − (Px)(Px)ᵀ/(den·λ), one SIMD-friendly matrix pass,
+            // written as β·P − s·sᵀ with s = √α·Px. Entry (i, j) then subtracts
+            // s_j·s_i and entry (j, i) subtracts s_i·s_j, the same product, so
+            // P stays bit-for-bit symmetric. (With α·(Px)_j·(Px)_i the two
+            // triangles round differently, and every later update multiplies
+            // that asymmetry by 1/λ until P is no longer definite.) The
+            // direct, validated diagonal is restored to avoid cancellation
             // drift from the distributed fused expression.
-            self.p
-                .ger(-fused.alpha_abs, &self.p_x, &self.p_x, fused.beta);
+            self.p_x.scale_mut(fused.alpha_abs.sqrt());
+            self.p.ger(-1.0, &self.p_x, &self.p_x, fused.beta);
             for j in 0..self.dimensions {
                 self.p[(j, j)] = self.candidate_diagonal[j];
             }
@@ -531,61 +823,216 @@ impl EwRls {
             self.p_abs_bound = exact_candidate_bound;
         }
 
-        // Persistent ridge refresh: the data step decayed all accumulated
-        // regularization by λ; re-inject it one coordinate at a time via a
-        // zero-target pseudo-observation x = √c·e_j, y = 0 (no forgetting on
-        // this step). c = γ(1 − λᵈ) makes the steady-state penalty per
-        // direction exactly γ right after its refresh. Shrinks θ_j toward 0
-        // and bounds P in direction j.
-        if self.gamma > 0.0 && self.lambda < 1.0 {
-            let c = self.gamma * (1.0 - self.lambda.powi(self.dimensions as i32));
-            let j = (self.updates % self.dimensions as u64) as usize;
-            self.p_x.copy_from(&self.p.column(j));
-            // den ≥ 1 since c ≥ 0 and P[jj] ≥ 0; skip the refresh on overflow.
-            let den = 1.0 + c * self.p_x[j];
-            if den.is_finite() {
-                let factor = c / den;
-                // Bound the largest θ and P corrections before committing,
-                // multiplying factor into the (often tiny) column first so a
-                // huge γ cannot overflow an intermediate. The cached absolute
-                // covariance bound covers every element; skip the refresh
-                // rather than store a non-finite value.
-                let theta_j = self.theta[j];
-                let column_max = self.p_x.amax();
-                let m = factor * column_max;
-                let theta_bound = self.theta.amax() + m * theta_j.abs();
-                let p_bound = inflate_bound(self.p_abs_bound + m * column_max);
-                if theta_bound.is_finite() && p_bound.is_finite() {
-                    for i in 0..self.dimensions {
-                        self.theta[i] -= (factor * self.p_x[i]) * theta_j;
-                    }
-                    self.p.ger(-factor, &self.p_x, &self.p_x, 1.0);
-                    self.p_abs_bound = p_bound;
-                }
+        // The data step forgot the ridge penalty and the sample mass by λ
+        // along with everything else. The mass is informational for an
+        // absolute ridge, so it saturates instead of rejecting the update.
+        self.weight_mass = (self.lambda * self.weight_mass + weight).min(f64::MAX);
+        if self.lambda < 1.0 {
+            self.ridge_information.scale_mut(self.lambda);
+        }
+        self.pending_decay = 1.0;
+        self.refresh_ridge();
+        self.floor_information();
+        self.apply_trace_cap();
+
+        self.updates += 1;
+        if self.updates.is_multiple_of(BOUND_REFRESH_INTERVAL) {
+            // Tighten the conservative bound before repeated triangle bounds
+            // make it unnecessarily force the exact fallback.
+            self.p_abs_bound = self.p.amax();
+        }
+        Ok(())
+    }
+
+    /// Persistent ridge refresh: tops coordinate `j = updates mod d` back up
+    /// to its target with a zero-target pseudo-observation `x = √c·e_j`,
+    /// `y = 0` (no forgetting on this step), where `c` is the penalty the
+    /// coordinate lost to forgetting since its last refresh, or gained in
+    /// target. Right after it, the coordinate holds exactly its target for any
+    /// sequence of forgetting factors. Shrinks `θ_j` toward 0 and bounds `P`
+    /// in direction `j`. A lower target is reached only through forgetting.
+    fn refresh_ridge(&mut self) {
+        let j = (self.updates % self.dimensions as u64) as usize;
+        let target = self.ridge_target(j);
+        let c = target - self.ridge_information[j];
+        if !(c > 0.0 && c.is_finite()) {
+            return;
+        }
+        // den ≥ 1 since c > 0 and P[jj] ≥ 0; skip the refresh on overflow and
+        // retry on the coordinate's next turn.
+        let den = 1.0 + c * self.p[(j, j)];
+        if den.is_finite()
+            && self.add_coordinate_information(j, 1.0 / den, (c / den).sqrt(), -self.theta[j])
+        {
+            self.ridge_information[j] = target;
+        }
+    }
+
+    /// Stabilized forgetting: where forgetting has left coordinate `j` with
+    /// `P_jj > 2δ`, adds information `1/δ − 1/P_jj` on it as a
+    /// pseudo-observation at the current `θ_j` (so `θ` is unchanged), which
+    /// brings `P_jj` back to `δ`. This bounds the inflation later updates
+    /// must cancel for any forgetting history. Informed directions change by
+    /// a relative `δ⁻¹/Ω`, and with `λ = 1` and no [`EwRls::decay`] it never
+    /// fires, since `P` stays below the prior.
+    fn floor_information(&mut self) {
+        let delta = self.initial_covariance;
+        for j in 0..self.dimensions {
+            let pjj = self.p[(j, j)];
+            if pjj > 2.0 * delta {
+                // `1 + c·P_jj = P_jj/δ` and `c/(1 + c·P_jj) = (1 − δ/P_jj)/P_jj`,
+                // formed without `1/δ`, which overflows for subnormal δ.
+                let shrink = delta / pjj;
+                let root = (1.0 - shrink).sqrt() / pjj.sqrt();
+                self.add_coordinate_information(j, shrink, root, 0.0);
             }
         }
+    }
 
-        // Optional wind-up cap: rescale P if its trace exceeded the cap.
+    /// Adds information `c > 0` on coordinate `j` without forgetting: a
+    /// pseudo-observation `x = √c·e_j` with residual `residual` (target
+    /// `θ_j + residual`), given as `shrink = 1/(1 + c·P_jj)` and
+    /// `root = √(c·shrink)`. It is the rank-1 downdate `P ← P − s·sᵀ` with
+    /// `s = root·P[:, j]`, except that row and column `j` are written as the
+    /// exact `shrink·P[:, j]`: the downdate `P_ij − s_i·s_j` cancels once
+    /// `c·P_jj` is large. The other diagonal entries are the Schur complement
+    /// `P_ii − s_i²`, which rounding can push below zero for a coordinate
+    /// (nearly) collinear with `j`, so the whole candidate is validated
+    /// first. Returns `false`, leaving the state untouched, if it is not
+    /// usable.
+    fn add_coordinate_information(
+        &mut self,
+        j: usize,
+        shrink: f64,
+        root: f64,
+        residual: f64,
+    ) -> bool {
+        if !(shrink >= 0.0 && root > 0.0 && root.is_finite()) {
+            return false;
+        }
+        self.p_x.copy_from(&self.p.column(j));
+        // Bound the largest θ and P corrections before committing,
+        // multiplying root into the (often tiny) column first so a huge `c`
+        // cannot overflow an intermediate. The cached absolute covariance
+        // bound covers every element.
+        let s_max = root * self.p_x.amax();
+        let theta_bound = self.theta.amax() + (root * s_max) * residual.abs();
+        let p_bound = inflate_bound(self.p_abs_bound + s_max * s_max);
+        if !(theta_bound.is_finite() && p_bound.is_finite()) {
+            return false;
+        }
+        for i in 0..self.dimensions {
+            let pij = self.p_x[i];
+            let dii = if i == j {
+                pij * shrink
+            } else {
+                let si = root * pij;
+                self.p[(i, i)] - si * si
+            };
+            if !(dii >= 0.0 && dii.is_finite()) {
+                return false;
+            }
+            self.candidate_diagonal[i] = dii;
+        }
+        self.p_x.scale_mut(root);
+        if residual != 0.0 {
+            // θ ← θ + (c·shrink)·P[:, j]·residual, with θ_j in exact form.
+            let theta_j = self.theta[j];
+            for i in 0..self.dimensions {
+                self.theta[i] += (self.p_x[i] * root) * residual;
+            }
+            self.theta[j] = (theta_j + residual) - residual * shrink;
+        }
+        // Bit-symmetric rank-1 downdate, then the exact row and column j and
+        // the validated diagonal.
+        self.p.ger(-1.0, &self.p_x, &self.p_x, 1.0);
+        for i in 0..self.dimensions {
+            let exact = self.p_x[i] / root * shrink;
+            self.p[(i, j)] = exact;
+            self.p[(j, i)] = exact;
+            self.p[(i, i)] = self.candidate_diagonal[i];
+        }
+        self.p_abs_bound = p_bound;
+        true
+    }
+
+    /// Ridge penalty coordinate `j` should hold right after its refresh.
+    fn ridge_target(&self, j: usize) -> f64 {
+        let weight = self.ridge_weights[j];
+        match self.ridge {
+            Ridge::Absolute(gamma) => gamma * weight,
+            Ridge::Relative(kappa) => kappa * self.weight_mass * weight,
+        }
+    }
+
+    /// Optional wind-up cap: rescale `P` if its trace exceeds the cap.
+    fn apply_trace_cap(&mut self) {
         let trace = self.p.trace();
         if trace > self.max_trace {
             let scale = self.max_trace / trace;
             self.p.scale_mut(scale);
             self.p_abs_bound = inflate_bound(self.p_abs_bound * scale);
         }
+    }
 
-        self.updates += 1;
-        if self.updates.is_multiple_of(SYMMETRIZE_INTERVAL) {
-            self.symmetrize();
-            // Tighten the conservative bound before repeated triangle bounds
-            // make it unnecessarily force the exact fallback.
-            self.p_abs_bound = self.p.amax();
+    /// Forget the accumulated information by `factor ∈ [0, 1]` without an
+    /// observation: `P ← P/factor`, while the ridge penalty and
+    /// [`EwRls::weight_mass`] shrink by `factor`. `θ` is unchanged.
+    ///
+    /// This is time-based forgetting for irregularly spaced observations:
+    /// keep `λ = 1` and call `decay(2^(−Δt/τ))` with half-life `τ` before each
+    /// update, or once per time bucket (also for buckets without updates).
+    /// Calls compose multiplicatively, and `decay(f)` followed by an update
+    /// with `λ = 1` minimizes the same objective as an update with `λ = f`.
+    /// It costs one `O(d²)` pass; when every decay is followed by an update
+    /// and a gap never forgets more than [`MIN_LAMBDA`], `set_lambda(f)`
+    /// before the update is equivalent and about 20% cheaper overall.
+    ///
+    /// When the product of the decays since the last update would fall below
+    /// [`MIN_LAMBDA`] (for `2^(−Δt/τ)`, a gap of more than about 20
+    /// half-lives, however it is split into calls), the remaining information
+    /// cannot be represented accurately in covariance form. It is then treated
+    /// as complete forgetting: the covariance is reset to the prior as by
+    /// [`EwRls::reset_covariance`], keeping `θ`, and [`DecayOutcome::Reset`] is
+    /// returned. The same happens if `P/factor` would overflow. Either way the
+    /// ridge is back at its target within `d` updates. A decay that leaves a
+    /// coordinate's variance above `2δ` pulls it back to `δ`, as described
+    /// in the crate-level safeguards.
+    ///
+    /// Does not count as an update ([`EwRls::updates`] is unchanged).
+    pub fn decay(&mut self, factor: f64) -> Result<DecayOutcome, Error> {
+        if !(0.0..=1.0).contains(&factor) {
+            return Err(Error::InvalidDecay(factor));
         }
-
-        Ok(UpdateReport {
-            prediction,
-            residual,
-            predictive_variance: quad,
-        })
+        if factor == 1.0 {
+            return Ok(DecayOutcome::Applied);
+        }
+        let pending_decay = self.pending_decay * factor;
+        if pending_decay < MIN_LAMBDA {
+            self.reset_covariance();
+            return Ok(DecayOutcome::Reset);
+        }
+        // Scaling carries the cached bound along. Rescan for the exact
+        // largest entry only when the scaled bound nears overflow, so that
+        // repeated decays cannot inflate a stale bound into a spurious
+        // overflow. If anything overflows, P is replaced below.
+        let beta = 1.0 / factor;
+        self.p.scale_mut(beta);
+        let mut bound = inflate_bound(self.p_abs_bound * beta);
+        if bound > FUSED_UPDATE_LIMIT {
+            bound = self.p.amax();
+        }
+        if !bound.is_finite() || !self.p.trace().is_finite() {
+            self.reset_covariance();
+            return Ok(DecayOutcome::Reset);
+        }
+        self.p_abs_bound = bound;
+        self.pending_decay = pending_decay;
+        self.ridge_information.scale_mut(factor);
+        self.weight_mass *= factor;
+        self.floor_information();
+        self.apply_trace_cap();
+        Ok(DecayOutcome::Applied)
     }
 
     /// Reset the model and fit a batch of observations.
@@ -709,35 +1156,78 @@ impl EwRls {
         Ok(())
     }
 
-    /// Reset the covariance to `δI`, keeping the learned parameters.
+    /// Reset the covariance to the prior, keeping the learned parameters.
     ///
     /// The standard recovery from [`Error::NumericalBreakdown`], and a common
     /// deliberate move after a known regime change to let the model re-adapt
     /// quickly without discarding `θ`.
+    ///
+    /// The prior is `P = diag((δ⁻¹ + g_j)⁻¹)`, where `g_j` is the ridge
+    /// penalty at zero data (`γ·s_j` for [`Ridge::Absolute`], `0` for
+    /// [`Ridge::Relative`]), rescaled if its trace exceeds the cap; the
+    /// [`EwRls::weight_mass`] restarts at `0`. Because `θ` is kept, this prior
+    /// (including its ridge part, until forgotten) is centred on the current
+    /// `θ` rather than on `0`; [`EwRls::reset`] also zeroes `θ`.
+    /// Allocation-free.
     pub fn reset_covariance(&mut self) {
-        let p0 = initial_scale(
+        self.weight_mass = 0.0;
+        self.pending_decay = 1.0;
+        for j in 0..self.dimensions {
+            self.ridge_information[j] = self.ridge_target(j);
+        }
+        self.p_abs_bound = fill_prior(
+            &mut self.p,
             self.initial_covariance,
-            self.gamma,
+            &self.ridge_information,
             self.max_trace,
-            self.dimensions,
         );
-        self.p = DMatrix::identity(self.dimensions, self.dimensions) * p0;
-        self.p_abs_bound = p0;
     }
 
-    /// Reset the model to its initial state (`θ = 0`, `P = δI`).
+    /// Reset the model to its initial state: `θ = 0`, the prior covariance
+    /// (see [`EwRls::reset_covariance`]), zero sample mass and update count.
+    ///
+    /// The configuration is kept, including a forgetting factor changed by
+    /// [`EwRls::set_lambda`] and a ridge changed by [`EwRls::set_ridge`].
     pub fn reset(&mut self) {
         self.theta.fill(0.0);
         self.reset_covariance();
         self.updates = 0;
     }
 
-    /// Change the forgetting factor at runtime (e.g. per-regime adaptation).
+    /// Change the forgetting factor applied by subsequent updates
+    /// (`MIN_LAMBDA <= lambda <= 1`), e.g. per-regime adaptation.
+    ///
+    /// For forgetting by elapsed time, prefer `λ = 1` with [`EwRls::decay`],
+    /// which also handles long gaps.
     pub fn set_lambda(&mut self, lambda: f64) -> Result<(), Error> {
-        if !(lambda > 0.0 && lambda <= 1.0) {
-            return Err(Error::InvalidLambda(lambda));
+        self.lambda = validate_lambda(lambda)?;
+        Ok(())
+    }
+
+    /// Change the persistent ridge at runtime.
+    ///
+    /// A higher target is reached by the refresh within `d` updates. A lower
+    /// target is reached only as forgetting (or
+    /// [`EwRls::reset_covariance`]) removes the existing penalty, since
+    /// information cannot be removed stably; with `λ = 1` and no
+    /// [`EwRls::decay`] it is never lowered.
+    ///
+    /// Rejected, like at build time, if a target `γ·s_j` overflows
+    /// ([`Error::InvalidRegularization`]) or the prior that
+    /// [`EwRls::reset_covariance`] would install under the new ridge has a
+    /// non-finite trace ([`Error::InvalidInitialCovariance`]).
+    pub fn set_ridge(&mut self, ridge: Ridge) -> Result<(), Error> {
+        let ridge = validate_ridge(ridge, &self.ridge_weights)?;
+        let trace = prior_trace(
+            self.initial_covariance,
+            self.max_trace,
+            self.dimensions,
+            |j| zero_mass_ridge(ridge, self.ridge_weights[j]),
+        );
+        if !trace.is_finite() {
+            return Err(Error::InvalidInitialCovariance(self.initial_covariance));
         }
-        self.lambda = lambda;
+        self.ridge = ridge;
         Ok(())
     }
 
@@ -777,13 +1267,37 @@ impl EwRls {
         self.lambda
     }
 
-    /// The persistent ridge penalty `γ`.
+    /// The persistent ridge strength: `γ` for [`Ridge::Absolute`], `κ` for
+    /// [`Ridge::Relative`].
     #[must_use]
     pub fn regularization(&self) -> f64 {
-        self.gamma
+        self.ridge.strength()
     }
 
-    /// Effective sample window `1 / (1 − λ)`; `f64::INFINITY` when `λ = 1`.
+    /// The persistent ridge configuration.
+    #[must_use]
+    pub fn ridge(&self) -> Ridge {
+        self.ridge
+    }
+
+    /// The per-coordinate ridge weights `s_j`.
+    #[must_use]
+    pub fn ridge_weights(&self) -> &[f64] {
+        self.ridge_weights.as_slice()
+    }
+
+    /// The discounted sample mass `W_t = Σ Λ_{i,t} w_i`: the total weight of
+    /// the observations the model currently remembers (`t` for unit weights
+    /// and `λ = 1`, about `1/(1 − λ)` in steady state). Reset to `0` by
+    /// [`EwRls::reset_covariance`] and by a [`DecayOutcome::Reset`];
+    /// saturates at `f64::MAX`.
+    #[must_use]
+    pub fn weight_mass(&self) -> f64 {
+        self.weight_mass
+    }
+
+    /// Effective sample window `1 / (1 − λ)` of the per-update forgetting;
+    /// `f64::INFINITY` when `λ = 1`. [`EwRls::decay`] is not included.
     #[must_use]
     pub fn effective_window(&self) -> f64 {
         if self.lambda < 1.0 {
@@ -874,30 +1388,139 @@ impl EwRls {
         Ok(self)
     }
 
+    /// Averages the entry pairs that differ. The updates keep `P` exactly
+    /// symmetric, so only restoring an asymmetric checkpoint needs this; it
+    /// is a bitwise no-op otherwise (touching equal pairs could round
+    /// subnormal entries).
+    #[cfg(feature = "serde")]
     fn symmetrize(&mut self) {
         for i in 0..self.dimensions {
             for j in (i + 1)..self.dimensions {
-                // 0.5a + 0.5b, not (a+b)/2: the sum can overflow for finite
-                // same-sign entries near f64::MAX.
-                let avg = 0.5 * self.p[(i, j)] + 0.5 * self.p[(j, i)];
-                self.p[(i, j)] = avg;
-                self.p[(j, i)] = avg;
+                let (a, b) = (self.p[(i, j)], self.p[(j, i)]);
+                if a != b {
+                    // 0.5a + 0.5b, not (a+b)/2: the sum can overflow for
+                    // finite same-sign entries near f64::MAX.
+                    let avg = 0.5 * a + 0.5 * b;
+                    self.p[(i, j)] = avg;
+                    self.p[(j, i)] = avg;
+                }
             }
         }
     }
 }
 
-/// Initial covariance scale `P₀ = 1/(δ⁻¹ + γ)`, capped by the trace limit.
+/// A-priori quantities shared by the two halves of an update.
+#[derive(Clone, Copy)]
+struct Innovation {
+    report: UpdateReport,
+    inv_den: f64,
+    gain_scale: f64,
+    weight: f64,
+}
+
+fn validate_lambda(lambda: f64) -> Result<f64, Error> {
+    if (MIN_LAMBDA..=1.0).contains(&lambda) {
+        Ok(lambda)
+    } else {
+        Err(Error::InvalidLambda(lambda))
+    }
+}
+
+/// Prior variance `1/(δ⁻¹ + g)` of one coordinate with ridge penalty `g`.
 /// Computed in a form that survives subnormal `δ` (where `1/δ` overflows)
-/// via the algebraically equal `δ/(1 + γδ)`.
-fn initial_scale(delta: f64, gamma: f64, max_trace: f64, dimensions: usize) -> f64 {
-    let inv = 1.0 / delta + gamma;
-    let p0 = if inv.is_finite() {
+/// via the algebraically equal `δ/(1 + gδ)`.
+fn prior_scale(delta: f64, g: f64) -> f64 {
+    let inv = 1.0 / delta + g;
+    if inv.is_finite() {
         1.0 / inv
     } else {
-        delta / (1.0 + gamma * delta)
-    };
-    p0.min(max_trace / dimensions as f64)
+        delta / (1.0 + g * delta)
+    }
+}
+
+/// Validates a ridge against the per-coordinate weights: the strength and
+/// every weight must be non-negative and finite, and so must every target
+/// `strength·s_j` at unit mass.
+fn validate_ridge(ridge: Ridge, weights: &DVector<f64>) -> Result<Ridge, Error> {
+    let strength = ridge.validate()?.strength();
+    for &weight in weights.iter() {
+        if !(weight >= 0.0 && weight.is_finite()) {
+            return Err(Error::InvalidRegularization(weight));
+        }
+        let target = strength * weight;
+        if !target.is_finite() {
+            return Err(Error::InvalidRegularization(target));
+        }
+    }
+    Ok(ridge)
+}
+
+/// Ridge penalty of a coordinate with weight `weight` at zero sample mass.
+fn zero_mass_ridge(ridge: Ridge, weight: f64) -> f64 {
+    match ridge {
+        Ridge::Absolute(gamma) => gamma * weight,
+        Ridge::Relative(_) => 0.0,
+    }
+}
+
+/// The prior covariance diagonal `(δ⁻¹ + g_j)⁻¹` for ridge penalties `g(j)`,
+/// rescaled to meet `max_trace`: passes each final entry to `write` in index
+/// order and returns the largest. A uniform diagonal is capped entry-wise at
+/// `max_trace / d`, the same rescaling without its rounding. Allocation-free.
+fn prior_diagonal(
+    delta: f64,
+    max_trace: f64,
+    d: usize,
+    g: impl Fn(usize) -> f64,
+    mut write: impl FnMut(usize, f64),
+) -> f64 {
+    let first = g(0);
+    if (1..d).all(|j| g(j) == first) {
+        let p0 = prior_scale(delta, first).min(max_trace / d as f64);
+        (0..d).for_each(|j| write(j, p0));
+        return p0;
+    }
+    let largest = (0..d).map(|j| prior_scale(delta, g(j))).fold(0.0, f64::max);
+    // Compare against the cap without forming a trace that may overflow. The
+    // capped largest entry is `budget`; scaling each entry by `v/largest ≤ 1`
+    // keeps a far smaller cap from passing through a subnormal factor.
+    let mut budget = f64::INFINITY;
+    if largest > 0.0 {
+        let relative_trace: f64 = (0..d).map(|j| prior_scale(delta, g(j)) / largest).sum();
+        budget = max_trace / relative_trace;
+    }
+    let capped = budget < largest;
+    for j in 0..d {
+        let v = prior_scale(delta, g(j));
+        write(j, if capped { v / largest * budget } else { v });
+    }
+    if capped { budget } else { largest }
+}
+
+/// Writes the prior covariance `diag((δ⁻¹ + g_j)⁻¹)` into `p` (see
+/// [`prior_diagonal`]) and returns its largest entry. Allocation-free.
+fn fill_prior(
+    p: &mut DMatrix<f64>,
+    delta: f64,
+    ridge_information: &DVector<f64>,
+    max_trace: f64,
+) -> f64 {
+    p.fill(0.0);
+    prior_diagonal(
+        delta,
+        max_trace,
+        ridge_information.len(),
+        |j| ridge_information[j],
+        |j, v| p[(j, j)] = v,
+    )
+}
+
+/// Trace of the prior [`fill_prior`] would install, summed in the order of
+/// `DMatrix::trace`, without building the matrix.
+fn prior_trace(delta: f64, max_trace: f64, d: usize, g: impl Fn(usize) -> f64) -> f64 {
+    let mut trace = 0.0;
+    prior_diagonal(delta, max_trace, d, g, |_, v| trace += v);
+    trace
 }
 
 #[derive(Clone, Copy)]
@@ -944,13 +1567,6 @@ fn inflate_bound(bound: f64) -> f64 {
     }
 }
 
-/// Sum a uniform diagonal in the same order as `DMatrix::trace` without
-/// allocating the matrix.
-#[cfg(feature = "serde")]
-fn diagonal_trace(value: f64, dimensions: usize) -> f64 {
-    (0..dimensions).fold(0.0, |trace, _| trace + value)
-}
-
 /// Allow only the rounding error accumulated while summing a live matrix's
 /// diagonal. This keeps serialized capped models round-trippable.
 #[cfg(feature = "serde")]
@@ -963,7 +1579,9 @@ fn trace_within_cap(trace: f64, max_trace: f64, dimensions: usize) -> bool {
 }
 
 /// Untrusted mirror of [`EwRls`] used to validate deserialized checkpoints
-/// before they become a live model.
+/// before they become a live model. Version 1 (ewrls ≤ 0.2.0) stored
+/// `gamma`; version 2 stores the ridge state, the sample mass, the pending
+/// decay and the covariance bound, so that a restore is bit-exact.
 #[cfg(feature = "serde")]
 #[derive(serde::Deserialize)]
 struct EwRlsCheckpoint {
@@ -975,18 +1593,207 @@ struct EwRlsCheckpoint {
     initial_covariance: f64,
     #[serde(deserialize_with = "serde_inf::deserialize")]
     max_trace: f64,
-    gamma: f64,
     updates: u64,
+    /// Version 1 only.
+    #[serde(default)]
+    gamma: Option<f64>,
+    /// Version 2 only.
+    #[serde(default)]
+    ridge: Option<Ridge>,
+    #[serde(default)]
+    ridge_weights: Option<DVector<f64>>,
+    #[serde(default)]
+    ridge_information: Option<DVector<f64>>,
+    #[serde(default)]
+    weight_mass: Option<f64>,
+    #[serde(default)]
+    pending_decay: Option<f64>,
+    #[serde(default)]
+    p_abs_bound: Option<f64>,
+}
+
+/// Every field name either checkpoint version may carry, in version 2 order
+/// with version 1's `gamma` last. Positional formats read the fields in the
+/// writer's order ([`EwRlsCheckpointRef`], or 0.2's layout for version 1);
+/// self-describing ones match them by name.
+#[cfg(feature = "serde")]
+const CHECKPOINT_FIELDS: &[&str] = &[
+    "version",
+    "theta",
+    "p",
+    "lambda",
+    "dimensions",
+    "initial_covariance",
+    "max_trace",
+    "ridge",
+    "ridge_weights",
+    "ridge_information",
+    "weight_mass",
+    "pending_decay",
+    "p_abs_bound",
+    "updates",
+    "gamma",
+];
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for EwRls {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_struct("EwRlsCheckpoint", CHECKPOINT_FIELDS, CheckpointVisitor)
+    }
+}
+
+#[cfg(feature = "serde")]
+struct CheckpointVisitor;
+
+#[cfg(feature = "serde")]
+impl<'de> serde::de::Visitor<'de> for CheckpointVisitor {
+    type Value = EwRls;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("an ewrls checkpoint")
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, map: A) -> Result<EwRls, A::Error> {
+        use serde::Deserialize;
+        let checkpoint =
+            EwRlsCheckpoint::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
+        EwRls::try_from(checkpoint).map_err(serde::de::Error::custom)
+    }
+
+    /// Positional formats (bincode, postcard) cannot skip absent fields, so
+    /// the layout is chosen by the leading version.
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<EwRls, A::Error> {
+        fn next<'de, T: serde::Deserialize<'de>, A: serde::de::SeqAccess<'de>>(
+            seq: &mut A,
+            index: usize,
+        ) -> Result<T, A::Error> {
+            seq.next_element()?
+                .ok_or_else(|| serde::de::Error::invalid_length(index, &"a complete checkpoint"))
+        }
+        let version: u32 = next(&mut seq, 0)?;
+        if version != 1 && version != CHECKPOINT_VERSION {
+            return Err(serde::de::Error::custom(format!(
+                "unsupported checkpoint version {version}; expected 1 or {CHECKPOINT_VERSION}"
+            )));
+        }
+        let mut checkpoint = EwRlsCheckpoint {
+            version,
+            theta: next(&mut seq, 1)?,
+            p: next(&mut seq, 2)?,
+            lambda: next(&mut seq, 3)?,
+            dimensions: next(&mut seq, 4)?,
+            initial_covariance: next(&mut seq, 5)?,
+            max_trace: next::<Option<f64>, _>(&mut seq, 6)?.unwrap_or(f64::INFINITY),
+            updates: 0,
+            gamma: None,
+            ridge: None,
+            ridge_weights: None,
+            ridge_information: None,
+            weight_mass: None,
+            pending_decay: None,
+            p_abs_bound: None,
+        };
+        if version == 1 {
+            checkpoint.gamma = Some(next(&mut seq, 7)?);
+            checkpoint.updates = next(&mut seq, 8)?;
+        } else {
+            checkpoint.ridge = Some(next(&mut seq, 7)?);
+            checkpoint.ridge_weights = Some(next(&mut seq, 8)?);
+            checkpoint.ridge_information = Some(next(&mut seq, 9)?);
+            checkpoint.weight_mass = Some(next(&mut seq, 10)?);
+            checkpoint.pending_decay = Some(next(&mut seq, 11)?);
+            checkpoint.p_abs_bound = Some(next(&mut seq, 12)?);
+            checkpoint.updates = next(&mut seq, 13)?;
+        }
+        EwRls::try_from(checkpoint).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Ridge, sample-mass and decay state of a checkpoint, per format version.
+#[cfg(feature = "serde")]
+struct RidgeState {
+    ridge: Ridge,
+    ridge_weights: DVector<f64>,
+    ridge_information: DVector<f64>,
+    weight_mass: f64,
+    pending_decay: f64,
+    p_abs_bound: Option<f64>,
+}
+
+#[cfg(feature = "serde")]
+impl EwRlsCheckpoint {
+    /// Called only after `dimensions` was checked against the stored `θ`, so
+    /// it never allocates by an untrusted size.
+    fn ridge_state(&mut self) -> Result<RidgeState, String> {
+        let d = self.dimensions;
+        if self.version == 1 {
+            let gamma = self.gamma.ok_or("version 1 checkpoint lacks gamma")?;
+            if self.ridge.is_some()
+                || self.ridge_weights.is_some()
+                || self.ridge_information.is_some()
+                || self.weight_mass.is_some()
+                || self.pending_decay.is_some()
+                || self.p_abs_bound.is_some()
+            {
+                return Err("version 1 checkpoint has version 2 fields".into());
+            }
+            // The penalty each coordinate held under 0.2's constant-λ schedule:
+            // Γ_0 = γ, every update forgets it by λ, and update u adds
+            // γ(1 − λᵈ) to coordinate u mod d. After n updates, coordinate j
+            // was refreshed k times, the last one s updates ago.
+            let (lambda, n, du) = (self.lambda, self.updates, d as u64);
+            let power = |e: u64| lambda.powf(e as f64);
+            let ridge_information = DVector::from_fn(d, |j, _| {
+                let j = j as u64;
+                if n <= j {
+                    return gamma * power(n);
+                }
+                let (s, k) = ((n - 1 - j) % du, (n - 1 - j) / du + 1);
+                gamma * power(s) * (1.0 + power((k - 1) * du) * (power(j + 1) - power(du)))
+            });
+            let weight_mass = if lambda < 1.0 {
+                (1.0 - power(n)) / (1.0 - lambda)
+            } else {
+                n as f64
+            };
+            return Ok(RidgeState {
+                ridge: Ridge::Absolute(gamma),
+                ridge_weights: DVector::from_element(d, 1.0),
+                ridge_information,
+                weight_mass,
+                pending_decay: 1.0,
+                p_abs_bound: None,
+            });
+        }
+        if self.gamma.is_some() {
+            return Err("version 2 checkpoint has the version 1 gamma field".into());
+        }
+        let missing = |field: &str| format!("version 2 checkpoint lacks {field}");
+        Ok(RidgeState {
+            ridge: self.ridge.ok_or_else(|| missing("ridge"))?,
+            ridge_weights: self
+                .ridge_weights
+                .take()
+                .ok_or_else(|| missing("ridge_weights"))?,
+            ridge_information: self
+                .ridge_information
+                .take()
+                .ok_or_else(|| missing("ridge_information"))?,
+            weight_mass: self.weight_mass.ok_or_else(|| missing("weight_mass"))?,
+            pending_decay: self.pending_decay.ok_or_else(|| missing("pending_decay"))?,
+            p_abs_bound: Some(self.p_abs_bound.ok_or_else(|| missing("p_abs_bound"))?),
+        })
+    }
 }
 
 #[cfg(feature = "serde")]
 impl TryFrom<EwRlsCheckpoint> for EwRls {
     type Error = String;
 
-    fn try_from(c: EwRlsCheckpoint) -> Result<Self, String> {
-        if c.version != CHECKPOINT_VERSION {
+    fn try_from(mut c: EwRlsCheckpoint) -> Result<Self, String> {
+        if c.version != 1 && c.version != CHECKPOINT_VERSION {
             return Err(format!(
-                "unsupported checkpoint version {}; expected {CHECKPOINT_VERSION}",
+                "unsupported checkpoint version {}; expected 1 or {CHECKPOINT_VERSION}",
                 c.version
             ));
         }
@@ -1004,8 +1811,9 @@ impl TryFrom<EwRlsCheckpoint> for EwRls {
                 c.p.ncols()
             ));
         }
-        if !(c.lambda > 0.0 && c.lambda <= 1.0) {
-            return Err(format!("lambda {} outside (0, 1]", c.lambda));
+        let state = c.ridge_state()?;
+        if validate_lambda(c.lambda).is_err() {
+            return Err(format!("lambda {} outside [{MIN_LAMBDA}, 1]", c.lambda));
         }
         if !(c.initial_covariance > 0.0 && c.initial_covariance.is_finite()) {
             return Err(format!(
@@ -1016,11 +1824,28 @@ impl TryFrom<EwRlsCheckpoint> for EwRls {
         if c.max_trace.is_nan() || c.max_trace <= 0.0 {
             return Err(format!("invalid max covariance trace {}", c.max_trace));
         }
-        if !(c.gamma >= 0.0 && c.gamma.is_finite()) {
-            return Err(format!("invalid regularization {}", c.gamma));
+        if state.ridge_weights.nrows() != d {
+            return Err(format!("ridge weights must have {d} entries"));
         }
-        let reset_scale = initial_scale(c.initial_covariance, c.gamma, c.max_trace, d);
-        if !diagonal_trace(reset_scale, d).is_finite() {
+        let ridge = validate_ridge(state.ridge, &state.ridge_weights)
+            .map_err(|e| format!("invalid ridge: {e}"))?;
+        let valid = |v: &f64| *v >= 0.0 && v.is_finite();
+        if state.ridge_information.nrows() != d || !state.ridge_information.iter().all(valid) {
+            return Err(format!(
+                "ridge information must be {d} non-negative finite values"
+            ));
+        }
+        if !valid(&state.weight_mass) {
+            return Err(format!("invalid weight mass {}", state.weight_mass));
+        }
+        if !(MIN_LAMBDA..=1.0).contains(&state.pending_decay) {
+            return Err(format!("invalid pending decay {}", state.pending_decay));
+        }
+        // The prior that reset_covariance would install must be usable too.
+        let reset_trace = prior_trace(c.initial_covariance, c.max_trace, d, |j| {
+            zero_mass_ridge(ridge, state.ridge_weights[j])
+        });
+        if !reset_trace.is_finite() {
             return Err("initial covariance produces a non-finite reset trace".into());
         }
         if c.theta.iter().any(|v| !v.is_finite()) {
@@ -1033,8 +1858,9 @@ impl TryFrom<EwRlsCheckpoint> for EwRls {
             return Err("covariance has a negative diagonal entry".into());
         }
         // The update algebra relies on P = Pᵀ (it uses P·x for both sides of
-        // the rank-1 product). Reject gross asymmetry; the residual rounding
-        // drift is removed below.
+        // the rank-1 product). Reject gross asymmetry; rounding-level
+        // asymmetry (from 0.2, which let it drift between symmetrizations) is
+        // averaged away below, since forgetting would amplify it.
         for i in 0..d {
             for j in (i + 1)..d {
                 let (a, b) = (c.p[(i, j)], c.p[(j, i)]);
@@ -1057,32 +1883,54 @@ impl TryFrom<EwRlsCheckpoint> for EwRls {
             ));
         }
 
+        // Test definiteness on a symmetrized, scaled copy.
+        let largest = c.p.amax();
+        if largest > 0.0 {
+            let half = c.p.map(|v| (v / largest) * 0.5);
+            let eigenvalues = (&half + half.transpose()).symmetric_eigenvalues();
+            if eigenvalues.iter().any(|&v| !v.is_finite() || v < -1e-12) {
+                return Err("covariance is not positive semidefinite".into());
+            }
+        }
+        let p_abs_bound = match state.p_abs_bound {
+            Some(bound) if bound.is_finite() && bound >= largest => bound,
+            Some(bound) => {
+                return Err(format!(
+                    "covariance bound {bound} is below the largest covariance entry {largest}"
+                ));
+            }
+            None => largest,
+        };
+
         let mut model = EwRls {
             theta: c.theta,
             p: c.p,
             // Workspace is scratch state; always rebuild it.
             p_x: DVector::zeros(d),
             candidate_diagonal: DVector::zeros(d),
-            p_abs_bound: 0.0,
+            p_abs_bound,
             lambda: c.lambda,
             dimensions: d,
             initial_covariance: c.initial_covariance,
             max_trace: c.max_trace,
-            gamma: c.gamma,
+            ridge,
+            ridge_weights: state.ridge_weights,
+            ridge_information: state.ridge_information,
+            weight_mass: state.weight_mass,
+            pending_decay: state.pending_decay,
             updates: c.updates,
         };
+        // Averages only differing pairs: a bitwise no-op for the exactly
+        // symmetric states this version writes, so their restore stays exact.
         model.symmetrize();
-        model.p_abs_bound = model.p.amax();
-        let scale = model.p_abs_bound;
-        if scale > 0.0 {
-            let eigenvalues = (&model.p / scale).symmetric_eigenvalues();
-            if eigenvalues.iter().any(|&v| !v.is_finite() || v < -1e-12) {
-                return Err("covariance is not positive semidefinite".into());
-            }
-        }
         Ok(model)
     }
 }
+
+/// Compiles and runs the README examples as doctests.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
 
 #[cfg(test)]
 mod tests {
@@ -1496,10 +2344,11 @@ mod tests {
     #[test]
     fn windup_guard_caps_trace() {
         // λ < 1 with only the first direction excited: without the cap,
-        // P[1,1] grows by 1/λ per step without bound.
+        // P[1,1] grows by 1/λ per step up to the prior floor at 2δ, which a
+        // weak prior puts far above the cap.
         let mut model = EwRls::builder(2)
             .lambda(0.9)
-            .initial_covariance(100.0)
+            .initial_covariance(1e6)
             .max_covariance_trace(1e4)
             .build()
             .unwrap();
@@ -1514,18 +2363,23 @@ mod tests {
     }
 
     #[test]
-    fn default_has_no_trace_cap() {
-        // Textbook default: the estimator is never silently rescaled, so
-        // under degenerate excitation the covariance grows freely.
+    fn unexcited_direction_saturates_at_the_prior() {
+        // No trace cap: under degenerate excitation P[1,1] grows by 1/λ per
+        // step until it would pass 2δ, and is then pulled back to δ within
+        // the same update. θ is untouched by the floor.
         let mut model = EwRls::builder(2)
             .lambda(0.9)
             .initial_covariance(100.0)
             .build()
             .unwrap();
+        let mut largest: f64 = 0.0;
         for _ in 0..500 {
             model.update(&[1.0, 0.0], 1.0).unwrap();
+            largest = largest.max(model.covariance()[(1, 1)]);
         }
-        assert!(model.covariance_trace() > 1e6);
+        assert!((0.9 * 200.0..=200.0).contains(&largest), "{largest}");
+        assert_eq!(model.params()[1], 0.0);
+        assert!((model.params()[0] - 1.0).abs() < 1e-12);
     }
 
     #[test]
@@ -1543,9 +2397,14 @@ mod tests {
 
     #[test]
     fn breakdown_leaves_state_unchanged() {
-        // λ at the bottom of its valid range: the 1/λ forgetting overflows
-        // the covariance. Must be detected before any state is modified.
-        let mut model = EwRls::builder(1).lambda(1e-308).build().unwrap();
+        // λ at the bottom of its valid range with a huge prior: the 1/λ
+        // forgetting overflows the covariance. Must be detected before any
+        // state is modified.
+        let mut model = EwRls::builder(1)
+            .lambda(MIN_LAMBDA)
+            .initial_covariance(1e305)
+            .build()
+            .unwrap();
         let theta_before = model.params().to_vec();
         let trace_before = model.covariance_trace();
 
@@ -1556,15 +2415,23 @@ mod tests {
         assert_eq!(model.params(), theta_before.as_slice());
         assert_eq!(model.covariance_trace(), trace_before);
         assert_eq!(model.updates(), 0);
+        assert_eq!(model.weight_mass(), 0.0);
     }
 
     #[test]
-    fn tiny_lambda_covariance_commit_matches_validation_order() {
-        // The textbook expression cancels to zero. Distributing 1/λ across
-        // the subtraction instead produces +Inf - Inf = NaN.
-        let mut model = EwRls::builder(1).lambda(1e-308).build().unwrap();
-        model.update(&[1.0], 1.0).unwrap();
-        assert_eq!(model.covariance()[(0, 0)], 0.0);
+    fn exact_fallback_commit_matches_validation_order() {
+        // P/λ overflows, so the fused path is refused and the exact fallback
+        // runs. The textbook expression cancels to a finite value;
+        // distributing 1/λ across the subtraction would give +Inf - Inf = NaN.
+        assert_eq!(1e303 / MIN_LAMBDA, f64::INFINITY);
+        let mut model = EwRls::builder(1)
+            .lambda(MIN_LAMBDA)
+            .initial_covariance(1e303)
+            .build()
+            .unwrap();
+        model.update(&[1e-150], 1.0).unwrap();
+        let p = model.covariance()[(0, 0)];
+        assert!(p.is_finite() && p >= 0.0, "committed variance {p}");
         assert!(model.covariance_trace().is_finite());
     }
 
@@ -1649,11 +2516,11 @@ mod tests {
         assert_eq!(restored.updates(), model.updates());
 
         // The format is explicit and rejects unknown schema versions.
-        assert!(json.contains("\"version\":1"));
-        let unsupported = json.replace("\"version\":1", "\"version\":2");
+        assert!(json.contains("\"version\":2"));
+        let unsupported = json.replace("\"version\":2", "\"version\":3");
         let err = serde_json::from_str::<EwRls>(&unsupported).unwrap_err();
         assert!(err.to_string().contains("checkpoint version"));
-        let unversioned = json.replacen("\"version\":1,", "", 1);
+        let unversioned = json.replacen("\"version\":2,", "", 1);
         assert!(serde_json::from_str::<EwRls>(&unversioned).is_err());
 
         // Dimensions inconsistent with the stored matrices must be rejected,
@@ -1661,6 +2528,8 @@ mod tests {
         let tampered = json.replace("\"dimensions\":2", "\"dimensions\":3");
         assert!(serde_json::from_str::<EwRls>(&tampered).is_err());
         let tampered = json.replace("\"lambda\":0.99", "\"lambda\":1.5");
+        assert!(serde_json::from_str::<EwRls>(&tampered).is_err());
+        let tampered = json.replace("\"lambda\":0.99", "\"lambda\":1e-9");
         assert!(serde_json::from_str::<EwRls>(&tampered).is_err());
     }
 
@@ -1910,5 +2779,794 @@ mod tests {
     fn effective_window() {
         assert!((EwRls::new(2, 0.99).unwrap().effective_window() - 100.0).abs() < 1e-9);
         assert!(EwRls::new(2, 1.0).unwrap().effective_window().is_infinite());
+    }
+
+    /// Deterministic uniform(-0.5, 0.5) stream (splitmix64).
+    fn uniform(state: &mut u64) -> f64 {
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        ((z ^ (z >> 31)) >> 11) as f64 / (1u64 << 53) as f64 - 0.5
+    }
+
+    /// Row with `y = Σ j·x_j + 0.1·noise`.
+    fn linear_row(state: &mut u64, d: usize) -> (Vec<f64>, f64) {
+        let x: Vec<f64> = (0..d).map(|_| uniform(state)).collect();
+        let y = x.iter().enumerate().map(|(j, v)| v * j as f64).sum::<f64>() + 0.1 * uniform(state);
+        (x, y)
+    }
+
+    fn max_relative_diff(a: &DVector<f64>, b: &DVector<f64>) -> f64 {
+        (a - b).amax() / b.amax().max(1e-300)
+    }
+
+    #[test]
+    fn covariance_is_exactly_symmetric_under_strong_forgetting() {
+        // Regression: the rank-1 update rounded the two triangles differently
+        // and every 1/λ amplified the asymmetry until the next symmetrization
+        // 256 updates later. At λ ≤ 0.85 that broke down within ~200 updates
+        // of well-excited data; at λ = 0.9 the asymmetry reached 3%.
+        for lambda in [0.9, 0.8, 0.7] {
+            let (d, mut s) = (5, 21u64);
+            let mut model = EwRls::builder(d)
+                .lambda(lambda)
+                .regularization(0.01)
+                .build()
+                .unwrap();
+            for _ in 0..2000 {
+                let (x, y) = linear_row(&mut s, d);
+                model.update(&x, y).unwrap();
+                let p = model.covariance();
+                assert_eq!(p, &p.transpose(), "λ = {lambda}");
+            }
+        }
+    }
+
+    #[test]
+    fn lambda_floor_is_enforced() {
+        assert_eq!(EwRls::new(2, 1e-7).unwrap_err(), Error::InvalidLambda(1e-7));
+        assert!(EwRls::new(2, MIN_LAMBDA).is_ok());
+        let mut model = EwRls::new(2, 0.99).unwrap();
+        assert_eq!(
+            model.set_lambda(1e-18).unwrap_err(),
+            Error::InvalidLambda(1e-18)
+        );
+        assert_eq!(model.lambda(), 0.99);
+    }
+
+    #[test]
+    fn decay_validation_and_identity() {
+        let mut model = EwRls::new(2, 1.0).unwrap();
+        model.update(&[1.0, 2.0], 3.0).unwrap();
+        for bad in [1.5, -0.1, f64::NAN, f64::INFINITY] {
+            assert!(matches!(model.decay(bad), Err(Error::InvalidDecay(_))));
+        }
+        let before = model.clone();
+        assert_eq!(model.decay(1.0).unwrap(), DecayOutcome::Applied);
+        assert_eq!(model.covariance(), before.covariance());
+        assert_eq!(model.weight_mass(), before.weight_mass());
+        assert_eq!(model.decay(0.0).unwrap(), DecayOutcome::Reset);
+        assert_eq!(model.params(), before.params());
+        assert_eq!(model.weight_mass(), 0.0);
+        assert_eq!(model.updates(), before.updates());
+    }
+
+    #[test]
+    fn long_gap_decay_resets_instead_of_corrupting() {
+        // Regression: one step at λ = 1e-18 used to be accepted, leave P
+        // indefinite and then reject almost every later update.
+        let (d, mut s) = (6, 1u64);
+        let mut model = EwRls::builder(d).lambda(0.999).build().unwrap();
+        for _ in 0..20_000 {
+            let (x, y) = linear_row(&mut s, d);
+            model.update(&x, y).unwrap();
+        }
+        let theta_before = model.params().to_vec();
+        for gap in [1e-18, 2f64.powi(-144), 0.0] {
+            assert_eq!(model.decay(gap).unwrap(), DecayOutcome::Reset);
+            assert_eq!(model.params(), theta_before.as_slice());
+        }
+        for _ in 0..1000 {
+            let (x, y) = linear_row(&mut s, d);
+            model.update(&x, y).unwrap();
+        }
+        for (j, &v) in model.params().iter().enumerate() {
+            assert!((v - j as f64).abs() < 0.02, "theta[{j}] = {v}");
+        }
+        let eigenvalues = model.covariance().clone().symmetric_eigenvalues();
+        assert!(eigenvalues.iter().all(|&v| v > 0.0));
+    }
+
+    #[test]
+    fn decay_then_unit_update_matches_lambda_update() {
+        let (d, mut s) = (4, 7u64);
+        let mut per_update = EwRls::builder(d)
+            .lambda(0.97)
+            .regularization(0.5)
+            .build()
+            .unwrap();
+        let mut decayed = EwRls::builder(d)
+            .lambda(1.0)
+            .regularization(0.5)
+            .build()
+            .unwrap();
+        for _ in 0..2000 {
+            let (x, y) = linear_row(&mut s, d);
+            per_update.update(&x, y).unwrap();
+            decayed.decay(0.97).unwrap();
+            decayed.update(&x, y).unwrap();
+        }
+        assert!(max_relative_diff(decayed.theta(), per_update.theta()) < 1e-10);
+        let p_diff = (decayed.covariance() - per_update.covariance()).amax()
+            / per_update.covariance().amax();
+        assert!(p_diff < 1e-10, "covariance differs by {p_diff}");
+        assert!((decayed.weight_mass() - per_update.weight_mass()).abs() < 1e-9);
+        assert!((per_update.weight_mass() - 1.0 / 0.03).abs() < 1e-6);
+    }
+
+    #[test]
+    fn time_varying_forgetting_matches_exact_objective() {
+        // Information-form oracle: R = Λ₀δ⁻¹I + Σ Λᵢwᵢxᵢxᵢᵀ, b = Σ Λᵢwᵢyᵢxᵢ.
+        let (d, mut s) = (5, 11u64);
+        let delta = 1e3;
+        let mut model = EwRls::builder(d)
+            .lambda(1.0)
+            .initial_covariance(delta)
+            .build()
+            .unwrap();
+        let mut info = DMatrix::identity(d, d) / delta;
+        let mut rhs = DVector::zeros(d);
+        let mut mass = 0.0;
+        for t in 0..5000 {
+            let (x, y) = linear_row(&mut s, d);
+            let w = 1.0 + uniform(&mut s); // in (0.5, 1.5)
+            if t % 10 == 0 {
+                // Bursty clock: a decay step in (0.1, 1] between some updates.
+                let f = 10f64.powf(-(uniform(&mut s) + 0.5));
+                model.decay(f).unwrap();
+                info *= f;
+                rhs *= f;
+                mass *= f;
+            }
+            let lambda = 0.99 + 0.01 * (uniform(&mut s) + 0.5); // in [0.99, 1)
+            model.set_lambda(lambda).unwrap();
+            model.update_weighted(&x, y, w).unwrap();
+            let xv = DVector::from_vec(x);
+            info = info * lambda + &xv * xv.transpose() * w;
+            rhs = rhs * lambda + &xv * (w * y);
+            mass = mass * lambda + w;
+        }
+        let exact = info.cholesky().unwrap().solve(&rhs);
+        let error = max_relative_diff(model.theta(), &exact);
+        assert!(
+            error < 1e-8,
+            "theta deviates from the exact minimizer by {error}"
+        );
+        assert!((model.weight_mass() - mass).abs() < 1e-9 * mass);
+    }
+
+    #[test]
+    fn ridge_band_holds_under_time_varying_forgetting() {
+        // Regression: the refresh used only the current λ, so with one decay
+        // every K rows most coordinates starved (Γ/γ down to 1e-8).
+        let d = 10;
+        for k in [1, 3, 5, 10] {
+            let mut model = EwRls::builder(d)
+                .lambda(1.0)
+                .initial_covariance(1e12)
+                .regularization(1.0)
+                .build()
+                .unwrap();
+            for t in 0..3000 {
+                if t % k == 0 {
+                    model.decay(0.97).unwrap();
+                }
+                // x = 0 rows only forget and refresh, so P stays diagonal
+                // with P[jj] = 1/(Λδ⁻¹ + Γ[jj]).
+                model.update(&[0.0; 10], 0.0).unwrap();
+            }
+            for j in 0..d {
+                let gamma_jj = 1.0 / model.covariance()[(j, j)];
+                assert!(
+                    (0.97f64.powi(9) - 1e-9..=1.0 + 1e-9).contains(&gamma_jj),
+                    "K = {k}: Γ[{j}{j}]/γ = {gamma_jj}"
+                );
+                let tracked = model.ridge_information[j];
+                assert!(
+                    (tracked - gamma_jj).abs() < 1e-9,
+                    "tracked {tracked} vs {gamma_jj}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn relative_ridge_follows_mass_and_spares_the_intercept() {
+        let run = |weights: [f64; 3]| {
+            let mut s = 5u64;
+            let mut model = EwRls::builder(3)
+                .lambda(1.0)
+                .ridge(Ridge::Relative(0.5))
+                .ridge_weights(&weights)
+                .build()
+                .unwrap();
+            for _ in 0..40_000 {
+                model.decay(0.9995).unwrap();
+                let x = [1.0, 2.0 * uniform(&mut s), 2.0 * uniform(&mut s)];
+                let y = 5.0 + 0.3 * x[1] - 0.2 * x[2] + 0.05 * uniform(&mut s);
+                model.update(&x, y).unwrap();
+            }
+            // Right after its refresh a coordinate holds exactly κ·W·s_j.
+            let j = ((model.updates() - 1) % 3) as usize;
+            let target = 0.5 * model.weight_mass() * weights[j];
+            assert!((model.ridge_information[j] - target).abs() <= 1e-12 * target.max(1.0));
+            model
+        };
+        // E[x²] = 1/3 per slope, penalty κ = 0.5 per unit mass: shrink 0.4.
+        let free = run([0.0, 1.0, 1.0]);
+        let theta = free.params();
+        assert!((theta[0] - 5.0).abs() < 0.02, "intercept {}", theta[0]);
+        assert!((theta[1] - 0.12).abs() < 0.02, "slope {}", theta[1]);
+        assert!((theta[2] + 0.08).abs() < 0.02, "slope {}", theta[2]);
+        assert!((free.weight_mass() - 1.0 / 0.0005).abs() < 1.0);
+        // Penalizing the intercept too shrinks it by 1/(1 + κ).
+        let penalized = run([1.0, 1.0, 1.0]);
+        assert!((penalized.params()[0] - 5.0 / 1.5).abs() < 0.05);
+    }
+
+    #[test]
+    fn ridge_configuration_validation_and_prior() {
+        assert_eq!(
+            EwRls::builder(3).ridge_weights(&[1.0]).build().unwrap_err(),
+            Error::DimensionMismatch {
+                expected: 3,
+                got: 1
+            }
+        );
+        assert_eq!(
+            EwRls::builder(2)
+                .ridge_weights(&[1.0, -1.0])
+                .build()
+                .unwrap_err(),
+            Error::InvalidRegularization(-1.0)
+        );
+        assert_eq!(
+            EwRls::builder(2)
+                .ridge(Ridge::Relative(f64::INFINITY))
+                .build()
+                .unwrap_err(),
+            Error::InvalidRegularization(f64::INFINITY)
+        );
+
+        // Per-coordinate prior diag((δ⁻¹ + γ·s_j)⁻¹), then the trace cap.
+        let model = EwRls::builder(3)
+            .initial_covariance(1e3)
+            .regularization(3.0)
+            .ridge_weights(&[0.0, 1.0, 2.0])
+            .build()
+            .unwrap();
+        let expected = [1e3, 1.0 / (1e-3 + 3.0), 1.0 / (1e-3 + 6.0)];
+        for (j, want) in expected.iter().enumerate() {
+            assert!((model.covariance()[(j, j)] - want).abs() < 1e-12 * want);
+        }
+        let capped = EwRls::builder(3)
+            .regularization(3.0)
+            .ridge_weights(&[0.0, 1.0, 2.0])
+            .max_covariance_trace(10.0)
+            .build()
+            .unwrap();
+        assert!(capped.covariance_trace() <= 10.0 * (1.0 + 1e-12));
+        assert!(capped.p_abs_bound >= capped.covariance().amax());
+
+        let mut model = EwRls::new(2, 1.0).unwrap();
+        assert_eq!(
+            model.set_ridge(Ridge::Absolute(-1.0)).unwrap_err(),
+            Error::InvalidRegularization(-1.0)
+        );
+        model.set_ridge(Ridge::Absolute(2.0)).unwrap();
+        model.update(&[1.0, 0.0], 1.0).unwrap();
+        model.update(&[0.0, 1.0], 1.0).unwrap();
+        assert_eq!(model.ridge_information.as_slice(), &[2.0, 2.0]);
+        assert_eq!(model.regularization(), 2.0);
+    }
+
+    #[test]
+    fn gated_update_can_veto() {
+        let (d, mut s) = (3, 9u64);
+        let mut model = EwRls::builder(d)
+            .lambda(0.98)
+            .regularization(0.1)
+            .build()
+            .unwrap();
+        for _ in 0..50 {
+            let (x, y) = linear_row(&mut s, d);
+            model.update(&x, y).unwrap();
+        }
+        let (x, y) = linear_row(&mut s, d);
+        let before = model.clone();
+        let mut seen = None;
+        let vetoed = model
+            .update_weighted_if(&x, y + 1e3, 2.0, |report| {
+                seen = Some(*report);
+                false
+            })
+            .unwrap();
+        assert!(vetoed.is_none());
+        assert_eq!(model.params(), before.params());
+        assert_eq!(model.covariance(), before.covariance());
+        assert_eq!(model.updates(), before.updates());
+        assert_eq!(model.weight_mass(), before.weight_mass());
+        let seen = seen.unwrap();
+        let expected_scale = 1.0 / 2.0 + seen.predictive_variance / 0.98;
+        assert!((seen.innovation_scale - expected_scale).abs() < 1e-12 * expected_scale);
+
+        let mut reference = model.clone();
+        let accepted = model.update_if(&x, y, |_| true).unwrap().unwrap();
+        let direct = reference.update(&x, y).unwrap();
+        assert_eq!(accepted, direct);
+        assert_eq!(model.params(), reference.params());
+        assert_eq!(model.covariance(), reference.covariance());
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn checkpoint_restore_is_bit_exact() {
+        // Regression: restoring used to re-symmetrize P, so a restore at any
+        // update count not divisible by 256 diverged from the live model.
+        let (d, mut s) = (12, 3u64);
+        let rows: Vec<_> = (0..6000).map(|_| linear_row(&mut s, d)).collect();
+        let builders = [
+            EwRls::builder(d).lambda(0.995).regularization(0.5),
+            EwRls::builder(d)
+                .lambda(1.0)
+                .ridge(Ridge::Relative(0.01))
+                .ridge_weights(&[0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 2.0]),
+        ];
+        for builder in builders {
+            for cut in [1000, 1023, 1024] {
+                let mut live = builder.clone().build().unwrap();
+                for (x, y) in &rows[..cut] {
+                    live.decay(0.999).unwrap();
+                    live.update(x, *y).unwrap();
+                }
+                let json = serde_json::to_string(&live).unwrap();
+                let mut restored: EwRls = serde_json::from_str(&json).unwrap();
+                assert_eq!(restored.covariance(), live.covariance());
+                for (x, y) in &rows[cut..] {
+                    for model in [&mut live, &mut restored] {
+                        model.decay(0.999).unwrap();
+                        model.update(x, *y).unwrap();
+                    }
+                }
+                assert_eq!(restored.params(), live.params(), "cut {cut}");
+                assert_eq!(restored.covariance(), live.covariance(), "cut {cut}");
+                assert_eq!(restored.weight_mass(), live.weight_mass());
+            }
+        }
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn version_1_checkpoint_still_loads() {
+        let mut model = EwRls::builder(2)
+            .lambda(0.99)
+            .regularization(0.3)
+            .build()
+            .unwrap();
+        for i in 0..7 {
+            model.update(&[1.0, f64::from(i)], 2.0).unwrap();
+        }
+        // Rewrite the current checkpoint into the 0.2 layout.
+        let mut value: serde_json::Value = serde_json::to_value(&model).unwrap();
+        let fields = value.as_object_mut().unwrap();
+        for key in [
+            "ridge",
+            "ridge_weights",
+            "ridge_information",
+            "weight_mass",
+            "pending_decay",
+            "p_abs_bound",
+        ] {
+            fields.remove(key).unwrap();
+        }
+        fields.insert("version".into(), 1.into());
+        fields.insert("gamma".into(), 0.3.into());
+        let v1 = value.to_string();
+
+        let restored: EwRls = serde_json::from_str(&v1).unwrap();
+        assert_eq!(restored.params(), model.params());
+        assert_eq!(restored.covariance(), model.covariance());
+        assert_eq!(restored.ridge(), Ridge::Absolute(0.3));
+        let mass = (1.0 - 0.99f64.powi(7)) / 0.01;
+        assert!((restored.weight_mass() - mass).abs() < 1e-12);
+
+        // A version 1 checkpoint must not carry version 2 fields.
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("weight_mass".into(), 1.0.into());
+        let mixed = value.to_string();
+        let err = serde_json::from_str::<EwRls>(&mixed).unwrap_err();
+        assert!(err.to_string().contains("version 2 fields"), "{err}");
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn checkpoint_rejects_an_understated_covariance_bound() {
+        let model = EwRls::new(2, 0.99).unwrap();
+        let json = serde_json::to_string(&model).unwrap();
+        let tampered = json.replace("\"p_abs_bound\":1000.0", "\"p_abs_bound\":1.0");
+        assert_ne!(tampered, json, "bound field not found");
+        let err = serde_json::from_str::<EwRls>(&tampered).unwrap_err();
+        assert!(err.to_string().contains("covariance bound"), "{err}");
+    }
+
+    /// Rewrites a live model's checkpoint into the 0.2 (version 1) layout.
+    #[cfg(feature = "serde")]
+    fn as_version_1(model: &EwRls, gamma: f64) -> serde_json::Value {
+        let mut value = serde_json::to_value(model).unwrap();
+        let fields = value.as_object_mut().unwrap();
+        for key in [
+            "ridge",
+            "ridge_weights",
+            "ridge_information",
+            "weight_mass",
+            "pending_decay",
+            "p_abs_bound",
+        ] {
+            fields.remove(key).unwrap();
+        }
+        fields.insert("version".into(), 1.into());
+        fields.insert("gamma".into(), gamma.into());
+        value
+    }
+
+    #[test]
+    fn chained_decays_cannot_bypass_the_floor() {
+        // Regression: the floor was checked per call, so a gap delivered as
+        // several decays (e.g. a per-second timer) still wedged the model.
+        let (d, mut s) = (6, 1u64);
+        let mut model = EwRls::builder(d).lambda(0.999).build().unwrap();
+        for _ in 0..20_000 {
+            let (x, y) = linear_row(&mut s, d);
+            model.update(&x, y).unwrap();
+        }
+        let outcomes: Vec<_> = (0..4)
+            .map(|_| model.decay(2f64.powi(-15)).unwrap())
+            .collect();
+        use DecayOutcome::{Applied, Reset};
+        assert_eq!(outcomes, [Applied, Reset, Applied, Reset]);
+        // A 10 h gap at τ = 10 min delivered as one decay per second.
+        model.set_lambda(1.0).unwrap();
+        let resets = (0..36_000)
+            .filter(|_| model.decay(2f64.powf(-1.0 / 600.0)).unwrap() == Reset)
+            .count();
+        assert!(resets > 0);
+        model.set_lambda(0.999).unwrap();
+        for _ in 0..1000 {
+            let (x, y) = linear_row(&mut s, d);
+            model.update(&x, y).unwrap();
+        }
+        for (j, &v) in model.params().iter().enumerate() {
+            assert!((v - j as f64).abs() < 0.02, "theta[{j}] = {v}");
+        }
+    }
+
+    #[test]
+    fn decay_before_every_update_has_no_spurious_resets() {
+        // Regression: the cached bound grew by 1/f per decay until it
+        // overflowed and forced a reset although P itself was small.
+        let (d, mut s) = (4, 13u64);
+        let mut model = EwRls::builder(d)
+            .lambda(1.0)
+            .regularization(0.1)
+            .build()
+            .unwrap();
+        for _ in 0..2000 {
+            assert_eq!(model.decay(0.05).unwrap(), DecayOutcome::Applied);
+            let (x, y) = linear_row(&mut s, d);
+            model.update(&x, y).unwrap();
+            assert!(model.p_abs_bound >= model.covariance().amax());
+        }
+    }
+
+    #[test]
+    fn ridge_products_and_prior_are_validated() {
+        // γ·s_j must be finite (it used to store an infinite target).
+        assert_eq!(
+            EwRls::builder(2)
+                .regularization(1e300)
+                .ridge_weights(&[1e10, 1.0])
+                .build()
+                .unwrap_err(),
+            Error::InvalidRegularization(f64::INFINITY)
+        );
+        // set_ridge applies build's prior check: a relative ridge has no
+        // penalty at zero data, so δ = 1e308 would give an infinite trace.
+        let mut model = EwRls::builder(2)
+            .initial_covariance(1e308)
+            .regularization(1.0)
+            .build()
+            .unwrap();
+        assert_eq!(
+            model.set_ridge(Ridge::Relative(0.1)).unwrap_err(),
+            Error::InvalidInitialCovariance(1e308)
+        );
+        assert_eq!(model.ridge(), Ridge::Absolute(1.0));
+        model.reset_covariance();
+        assert!(model.covariance_trace().is_finite());
+    }
+
+    #[test]
+    fn weight_mass_saturates_instead_of_rejecting() {
+        let mut model = EwRls::new(1, 1.0).unwrap();
+        model.update_weighted(&[1.0], 1.0, 1e308).unwrap();
+        model.update_weighted(&[1.0], 1.0, 1e308).unwrap();
+        assert_eq!(model.weight_mass(), f64::MAX);
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn version_1_ridge_reconstruction_matches_the_old_schedule() {
+        // 0.2's recursion: Γ_0 = γ; each update forgets by λ, then update u
+        // adds γ(1 − λᵈ) to coordinate u mod d (including its first-cycle
+        // overshoot above γ).
+        let (d, lambda, gamma) = (3usize, 0.97_f64, 0.4);
+        for n in 0..12u64 {
+            let mut old = vec![gamma; d];
+            for u in 0..n {
+                old.iter_mut().for_each(|g| *g *= lambda);
+                old[(u % d as u64) as usize] += gamma * (1.0 - lambda.powi(d as i32));
+            }
+            let mut model = EwRls::builder(d)
+                .lambda(lambda)
+                .regularization(gamma)
+                .build()
+                .unwrap();
+            for _ in 0..n {
+                model.update(&[0.0; 3], 0.0).unwrap();
+            }
+            let restored: EwRls = serde_json::from_value(as_version_1(&model, gamma)).unwrap();
+            for (j, &want) in old.iter().enumerate() {
+                let got = restored.ridge_information[j];
+                assert!(
+                    (got - want).abs() <= 1e-14 * want,
+                    "n {n}, j {j}: {got} vs {want}"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn corrupt_version_1_dimensions_are_rejected_without_allocating() {
+        // Regression: the version 1 reconstruction allocated by `dimensions`
+        // before the shape checks, so a huge value panicked or aborted.
+        let model = EwRls::builder(2)
+            .lambda(0.99)
+            .regularization(0.3)
+            .build()
+            .unwrap();
+        let mut value = as_version_1(&model, 0.3);
+        value["dimensions"] = serde_json::json!(u64::MAX);
+        let err = serde_json::from_value::<EwRls>(value).unwrap_err();
+        assert!(err.to_string().contains("theta has 2 rows"), "{err}");
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn asymmetric_restored_state_is_symmetrized() {
+        // A 0.2 checkpoint may carry rounding-level asymmetry, which
+        // forgetting would amplify by 1/λ per update; restore averages it.
+        let (d, mut s) = (4, 17u64);
+        let mut model = EwRls::builder(d).lambda(0.7).build().unwrap();
+        for _ in 0..50 {
+            let (x, y) = linear_row(&mut s, d);
+            model.update(&x, y).unwrap();
+        }
+        let mut value = as_version_1(&model, 0.0);
+        // nalgebra serializes the matrix data column-major, then the shape.
+        let entry = &mut value["p"][0][1]; // P[1, 0]
+        *entry = serde_json::json!(entry.as_f64().unwrap() * (1.0 + 1e-10));
+        let mut restored: EwRls = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.covariance(), &restored.covariance().transpose());
+        for _ in 0..254 {
+            let (x, y) = linear_row(&mut s, d);
+            restored.update(&x, y).unwrap();
+        }
+    }
+
+    /// Warm model: `n` dense rows at `λ = 1`.
+    fn warm_model(builder: Builder, d: usize, n: usize, s: &mut u64) -> EwRls {
+        let mut model = builder.lambda(1.0).build().unwrap();
+        for _ in 0..n {
+            let (x, y) = linear_row(s, d);
+            model.update(&x, y).unwrap();
+        }
+        model
+    }
+
+    /// Every one of `n` dense rows must be accepted, and `θ` must track the
+    /// truth `θ_j = j` again.
+    fn assert_recovers(model: &mut EwRls, d: usize, n: usize, s: &mut u64) {
+        for t in 0..n {
+            let (x, y) = linear_row(s, d);
+            model
+                .update(&x, y)
+                .unwrap_or_else(|e| panic!("row {t}: {e}"));
+        }
+        for (j, &v) in model.params().iter().enumerate() {
+            assert!((v - j as f64).abs() < 0.05, "θ[{j}] = {v}");
+        }
+    }
+
+    #[test]
+    fn zero_rows_between_decays_cannot_bypass_the_floor() {
+        // Regression: every commit reset the pending decay, so decays just
+        // above MIN_LAMBDA separated by x = 0 rows forgot 1e-18 in total,
+        // after which most updates were rejected.
+        let (d, mut s) = (6, 1u64);
+        let mut model = warm_model(EwRls::builder(d), d, 20_000, &mut s);
+        for _ in 0..2 {
+            assert_eq!(model.decay(1.2e-6).unwrap(), DecayOutcome::Applied);
+            model.update(&[0.0; 6], 0.0).unwrap();
+        }
+        assert_eq!(model.decay(1.2e-6).unwrap(), DecayOutcome::Applied);
+        assert!((0..d).all(|j| model.covariance()[(j, j)] <= 2e3));
+        assert_recovers(&mut model, d, 2000, &mut s);
+    }
+
+    #[test]
+    fn sparse_rows_between_gaps_keep_the_model_healthy() {
+        // Regression: one row after each 12-half-life gap re-anchored only
+        // the observed direction; the others inflated until P was indefinite.
+        let d = 12;
+        for ridge in [
+            Ridge::Absolute(0.0),
+            Ridge::Absolute(0.01),
+            Ridge::Relative(0.01),
+        ] {
+            let mut s = 1u64;
+            let mut model = warm_model(EwRls::builder(d).ridge(ridge), d, 20_000, &mut s);
+            for _ in 0..6 {
+                model.decay(2f64.powi(-12)).unwrap();
+                let (x, y) = linear_row(&mut s, d);
+                model.update(&x, y).unwrap();
+            }
+            let p = model.covariance();
+            let eigenvalues = ((p + p.transpose()) * (0.5 / p.amax())).symmetric_eigenvalues();
+            assert!(eigenvalues.min() > 0.0, "{ridge:?}: {}", eigenvalues.min());
+            for _ in 0..3000 {
+                let (x, y) = linear_row(&mut s, d);
+                model.update(&x, y).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn decay_before_a_small_lambda_is_bounded() {
+        // Regression: the decay floor ignored the λ of the next update, so
+        // one interval could forget MIN_LAMBDA².
+        let (d, mut s) = (6, 1u64);
+        let mut model = warm_model(EwRls::builder(d), d, 20_000, &mut s);
+        for _ in 0..2 {
+            assert_eq!(model.decay(1.01e-6).unwrap(), DecayOutcome::Applied);
+            model.set_lambda(1e-6).unwrap();
+            let (x, y) = linear_row(&mut s, d);
+            model.update(&x, y).unwrap();
+        }
+        model.set_lambda(0.999).unwrap();
+        assert_recovers(&mut model, d, 2000, &mut s);
+    }
+
+    #[test]
+    fn split_gap_leaves_the_prior() {
+        // Regression: after a Reset inside a gap split into calls, the rest
+        // of the gap inflated the fresh prior (39 × decay(0.5) gave 5e8).
+        let mut model = EwRls::builder(2).lambda(1.0).build().unwrap();
+        model.update(&[1.0, 2.0], 1.0).unwrap();
+        for _ in 0..39 {
+            model.decay(0.5).unwrap();
+        }
+        assert!((0..2).all(|j| model.covariance()[(j, j)] <= 2e3));
+    }
+
+    #[test]
+    fn ridge_refresh_is_exact_on_a_vague_prior() {
+        // Regression: the refresh downdate P_jj − (√f·P_jj)² cancelled to 0
+        // once c·P_jj ≳ 1e15, freezing the coordinate.
+        let mut model = EwRls::builder(2)
+            .lambda(1.0)
+            .initial_covariance(1e12)
+            .ridge(Ridge::Relative(1.0))
+            .build()
+            .unwrap();
+        model.update_weighted(&[1.0, 0.0], 1.0, 1e4).unwrap();
+        model.update_weighted(&[1.0, 0.0], 1.0, 1e4).unwrap();
+        let p11 = model.covariance()[(1, 1)];
+        assert!((p11 - 5e-5).abs() < 1e-12 * 5e-5, "{p11}");
+    }
+
+    #[test]
+    fn floor_handles_a_subnormal_prior() {
+        // 1/δ overflows here, so the floor must not form it.
+        let delta = 1e-310;
+        let mut model = EwRls::builder(1)
+            .lambda(0.5)
+            .initial_covariance(delta)
+            .build()
+            .unwrap();
+        for _ in 0..50 {
+            model.update(&[0.0], 0.0).unwrap();
+            assert!(model.covariance()[(0, 0)] <= 2.0 * delta);
+        }
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn capped_prior_far_below_delta_restores() {
+        // Regression: the cap's scale factor went subnormal, so the model
+        // exceeded its own cap and failed to restore from its checkpoint.
+        let model = EwRls::builder(2)
+            .initial_covariance(4.3e110)
+            .regularization(1.0)
+            .ridge_weights(&[0.0, 1.0])
+            .max_covariance_trace(1e-200)
+            .build()
+            .unwrap();
+        let json = serde_json::to_string(&model).unwrap();
+        let restored: EwRls = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.covariance(), model.covariance());
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn checkpoints_round_trip_through_positional_formats() {
+        // Regression: the reader's field order and types differed from the
+        // writer's, which only self-describing formats tolerate.
+        #[derive(serde::Serialize)]
+        struct Version1<'a> {
+            version: u32,
+            theta: &'a DVector<f64>,
+            p: &'a DMatrix<f64>,
+            lambda: f64,
+            dimensions: usize,
+            initial_covariance: f64,
+            max_trace: Option<f64>,
+            gamma: f64,
+            updates: u64,
+        }
+        let (d, mut s) = (3, 5u64);
+        let mut model = EwRls::builder(d)
+            .lambda(0.99)
+            .regularization(0.5)
+            .build()
+            .unwrap();
+        for _ in 0..7 {
+            let (x, y) = linear_row(&mut s, d);
+            model.update(&x, y).unwrap();
+        }
+        let bytes = bincode::serialize(&model).unwrap();
+        let restored: EwRls = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(restored.params(), model.params());
+        assert_eq!(restored.covariance(), model.covariance());
+        assert_eq!(restored.weight_mass(), model.weight_mass());
+
+        // The 0.2 layout, in 0.2's field order.
+        let v1 = Version1 {
+            version: 1,
+            theta: model.theta(),
+            p: model.covariance(),
+            lambda: 0.99,
+            dimensions: d,
+            initial_covariance: 1e3,
+            max_trace: None,
+            gamma: 0.5,
+            updates: model.updates(),
+        };
+        let restored: EwRls = bincode::deserialize(&bincode::serialize(&v1).unwrap()).unwrap();
+        assert_eq!(restored.covariance(), model.covariance());
+        assert_eq!(restored.ridge(), Ridge::Absolute(0.5));
     }
 }
